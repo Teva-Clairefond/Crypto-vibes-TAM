@@ -1,0 +1,9 @@
+Hash cible:
+35b95f7c0f63631c453220fb2a86f218
+
+Commande hashcat attendue par le sujet:
+hashcat -m 0 -a 3 md5_yolo.txt ?u?u?l?l?u?u?s
+
+Resultat:
+Non resolu automatiquement dans cet environnement local, car `hashcat` n'est pas installe
+et la recherche brute force complete du masque demande n'est pas realiste sans l'outil dedie.

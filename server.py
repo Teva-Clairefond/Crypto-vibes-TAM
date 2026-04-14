@@ -38,6 +38,12 @@ DEFAULT_PASSWORD_RULES = {
     "require_lowercase": True,
     "require_digit": True,
 }
+PASSWORD_HASH_ALGORITHM = "scrypt"
+PASSWORD_HASH_COST = "n=16384,r=8,p=1"
+PASSWORD_HASH_N = 16384
+PASSWORD_HASH_R = 8
+PASSWORD_HASH_P = 1
+PASSWORD_SALT_BYTES = 16
 
 clients = {}
 rooms = {DEFAULT_ROOM: None}
@@ -145,27 +151,18 @@ def load_password_rules():
     with open(PASSWORD_RULES_FILE, "r", encoding="utf-8") as rules_file:
         loaded_rules = json.load(rules_file)
 
-    return {
-        "min_length": int(loaded_rules.get("min_length", DEFAULT_PASSWORD_RULES["min_length"])),
-        "require_uppercase": bool(
-            loaded_rules.get(
-                "require_uppercase",
-                DEFAULT_PASSWORD_RULES["require_uppercase"],
-            )
-        ),
-        "require_lowercase": bool(
-            loaded_rules.get(
-                "require_lowercase",
-                DEFAULT_PASSWORD_RULES["require_lowercase"],
-            )
-        ),
-        "require_digit": bool(
-            loaded_rules.get(
-                "require_digit",
-                DEFAULT_PASSWORD_RULES["require_digit"],
-            )
-        ),
-    }
+    min_length = loaded_rules.get("min_length", DEFAULT_PASSWORD_RULES["min_length"])
+    if not isinstance(min_length, int) or isinstance(min_length, bool) or min_length <= 0:
+        raise ValueError("password_rules.json: min_length doit etre un entier strictement positif.")
+
+    validated_rules = {"min_length": min_length}
+    for key in ("require_uppercase", "require_lowercase", "require_digit"):
+        value = loaded_rules.get(key, DEFAULT_PASSWORD_RULES[key])
+        if not isinstance(value, bool):
+            raise ValueError(f"password_rules.json: {key} doit etre un booleen JSON.")
+        validated_rules[key] = value
+
+    return validated_rules
 
 
 def ensure_password_store_file():
@@ -186,8 +183,24 @@ def load_password_store():
             if not line:
                 continue
 
-            username, stored_hash = line.split(":", 1)
-            loaded_store[username] = stored_hash
+            if line.count(":") < 4:
+                username, stored_hash = line.rsplit(":", 1)
+                loaded_store[username] = {
+                    "format": "legacy_md5",
+                    "hash": stored_hash,
+                }
+                continue
+
+            parts = line.rsplit(":", 4)
+            if len(parts) == 5:
+                username, algorithm, cost, salt_b64, digest_b64 = parts
+                loaded_store[username] = {
+                    "format": "modern",
+                    "algorithm": algorithm,
+                    "cost": cost,
+                    "salt": salt_b64,
+                    "digest": digest_b64,
+                }
 
     return loaded_store
 
@@ -197,7 +210,15 @@ def save_password_store():
 
     with open(temp_path, "w", encoding="utf-8") as store_file:
         for username in sorted(password_store):
-            store_file.write(f"{username}:{password_store[username]}\n")
+            record = password_store[username]
+            if record["format"] == "legacy_md5":
+                store_file.write(f"{username}:{record['hash']}\n")
+                continue
+
+            store_file.write(
+                f"{username}:{record['algorithm']}:{record['cost']}:"
+                f"{record['salt']}:{record['digest']}\n"
+            )
 
     os.replace(temp_path, PASSWORD_STORE_FILE)
 
@@ -207,12 +228,58 @@ def hash_password_md5_base64(password):
     return base64.b64encode(digest).decode("ascii")
 
 
-def verify_password_constant_time(password, stored_hash):
+def build_scrypt_password_record(password):
+    salt = os.urandom(PASSWORD_SALT_BYTES)
+    digest = hashlib.scrypt(
+        password.encode("utf-8"),
+        salt=salt,
+        n=PASSWORD_HASH_N,
+        r=PASSWORD_HASH_R,
+        p=PASSWORD_HASH_P,
+    )
+    return {
+        "format": "modern",
+        "algorithm": PASSWORD_HASH_ALGORITHM,
+        "cost": PASSWORD_HASH_COST,
+        "salt": base64.b64encode(salt).decode("ascii"),
+        "digest": base64.b64encode(digest).decode("ascii"),
+    }
+
+
+def verify_legacy_password(password, stored_hash):
     candidate_hash = hash_password_md5_base64(password)
     return hmac.compare_digest(
         candidate_hash.encode("ascii"),
         stored_hash.encode("ascii"),
     )
+
+
+def parse_scrypt_cost(cost):
+    values = {}
+    for item in cost.split(","):
+        key, raw_value = item.split("=", 1)
+        values[key] = int(raw_value)
+    return values["n"], values["r"], values["p"]
+
+
+def verify_password_constant_time(password, stored_record):
+    if stored_record["format"] == "legacy_md5":
+        return verify_legacy_password(password, stored_record["hash"])
+
+    if stored_record["algorithm"] != PASSWORD_HASH_ALGORITHM:
+        return False
+
+    n_value, r_value, p_value = parse_scrypt_cost(stored_record["cost"])
+    salt = base64.b64decode(stored_record["salt"].encode("ascii"))
+    expected_digest = base64.b64decode(stored_record["digest"].encode("ascii"))
+    candidate_digest = hashlib.scrypt(
+        password.encode("utf-8"),
+        salt=salt,
+        n=n_value,
+        r=r_value,
+        p=p_value,
+    )
+    return hmac.compare_digest(candidate_digest, expected_digest)
 
 
 def validate_password_rules(password):
@@ -425,13 +492,13 @@ def authenticate_known_user(client_socket, buffer):
         username = None if client_info is None else client_info["username"]
 
         with auth_lock:
-            stored_hash = password_store.get(username)
+            stored_record = password_store.get(username)
 
-        if stored_hash is None:
+        if stored_record is None:
             send_line(client_socket, "AUTH_RETRY Compte introuvable.")
             return False, buffer
 
-        if not verify_password_constant_time(password, stored_hash):
+        if not verify_password_constant_time(password, stored_record):
             write_log(
                 "AUTH_REJECTED",
                 client=client_address,
@@ -439,6 +506,19 @@ def authenticate_known_user(client_socket, buffer):
             )
             send_line(client_socket, "AUTH_RETRY Mot de passe incorrect.")
             continue
+
+        if stored_record["format"] == "legacy_md5":
+            with auth_lock:
+                password_store[username] = build_scrypt_password_record(password)
+                save_password_store()
+            send_line(client_socket, "AUTH_INFO Mot de passe migre vers un hash moderne.")
+            write_log(
+                "PASSWORD_MIGRATED",
+                client=client_address,
+                username=username,
+                algorithm=PASSWORD_HASH_ALGORITHM,
+                cost=PASSWORD_HASH_COST,
+            )
 
         authenticated_info = mark_client_authenticated(client_socket)
         if authenticated_info is None:
@@ -493,9 +573,9 @@ def register_new_user(client_socket, buffer):
             send_line(client_socket, f"AUTH_RETRY {' '.join(rule_errors)}")
             continue
 
-        stored_hash = hash_password_md5_base64(password)
+        stored_record = build_scrypt_password_record(password)
         with auth_lock:
-            password_store[username] = stored_hash
+            password_store[username] = stored_record
             save_password_store()
 
         authenticated_info = mark_client_authenticated(client_socket)
@@ -513,6 +593,8 @@ def register_new_user(client_socket, buffer):
             "ACCOUNT_CREATED",
             client=authenticated_info["address"],
             username=authenticated_info["username"],
+            algorithm=PASSWORD_HASH_ALGORITHM,
+            cost=PASSWORD_HASH_COST,
         )
         write_log(
             "AUTH_ACCEPTED",
