@@ -2,11 +2,20 @@ import ctypes
 import socket
 import sys
 import threading
+import base64
+import os
+from crypto_utils import (
+    build_transport_key_record_from_metadata,
+    decrypt_transport_message,
+    encrypt_transport_message,
+    parse_transport_key_metadata,
+)
 
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 5000
 BUFFER_SIZE = 4096
+USER_STORAGE_DIR = "users"
 
 
 def parse_args(argv):
@@ -57,7 +66,7 @@ def receive_line(sock, buffer):
     return raw_line.rstrip(b"\r"), buffer
 
 
-def receive_messages(sock, stop_event, initial_buffer=b""):
+def receive_messages(sock, stop_event, transport_key, initial_buffer=b""):
     buffer = initial_buffer
 
     try:
@@ -69,6 +78,14 @@ def receive_messages(sock, stop_event, initial_buffer=b""):
                 break
 
             message = raw_message.decode("utf-8", errors="replace")
+            if message.startswith("ENCMSG "):
+                try:
+                    message = decrypt_transport_message(
+                        message[len("ENCMSG "):],
+                        transport_key,
+                    )
+                except ValueError:
+                    message = "[client] Impossible de dechiffrer le message."
             print(message, flush=True)
     except OSError:
         if not stop_event.is_set():
@@ -82,6 +99,19 @@ def read_console_line(prompt):
         return sys.stdin.readline()
     except OSError:
         return ""
+
+
+def get_user_storage_directory(username):
+    safe_username = base64.urlsafe_b64encode(username.encode("utf-8")).decode("ascii")
+    return os.path.join(USER_STORAGE_DIR, safe_username)
+
+
+def save_transport_key_record(username, serialized_record):
+    user_directory = get_user_storage_directory(username)
+    os.makedirs(user_directory, exist_ok=True)
+    key_path = os.path.join(user_directory, "key.txt")
+    with open(key_path, "w", encoding="utf-8") as key_file:
+        key_file.write(serialized_record + "\n")
 
 
 def negotiate_username(sock):
@@ -121,7 +151,7 @@ def authenticate_password(sock, buffer):
     raw_mode, buffer = receive_line(sock, buffer)
     if raw_mode is None:
         print("Connexion fermee par le serveur.")
-        return False, buffer
+        return False, None, buffer
 
     auth_mode_response = raw_mode.decode("utf-8", errors="replace")
     if auth_mode_response == "AUTH_MODE LOGIN":
@@ -131,13 +161,13 @@ def authenticate_password(sock, buffer):
         print("Nouveau compte detecte. Creation du mot de passe.")
     else:
         print(f"Reponse inattendue du serveur: {auth_mode_response}")
-        return False, buffer
+        return False, None, buffer
 
     while True:
         if auth_mode == "LOGIN":
             line = read_console_line("Password: ")
             if line == "":
-                return False, buffer
+                return False, None, buffer
 
             password = line.rstrip("\r\n")
 
@@ -145,15 +175,15 @@ def authenticate_password(sock, buffer):
                 sock.sendall((password + "\n").encode("utf-8"))
             except OSError:
                 print("Impossible d'envoyer le mot de passe: connexion fermee.")
-                return False, buffer
+                return False, None, buffer
         else:
             password_line = read_console_line("New password: ")
             if password_line == "":
-                return False, buffer
+                return False, None, buffer
 
             confirmation_line = read_console_line("Confirm password: ")
             if confirmation_line == "":
-                return False, buffer
+                return False, None, buffer
 
             password = password_line.rstrip("\r\n")
             confirmation = confirmation_line.rstrip("\r\n")
@@ -163,33 +193,58 @@ def authenticate_password(sock, buffer):
                 sock.sendall((confirmation + "\n").encode("utf-8"))
             except OSError:
                 print("Impossible d'envoyer le mot de passe: connexion fermee.")
-                return False, buffer
+                return False, None, buffer
 
         raw_response, buffer = receive_line(sock, buffer)
         if raw_response is None:
             print("Connexion fermee par le serveur.")
-            return False, buffer
+            return False, None, buffer
 
         response = raw_response.decode("utf-8", errors="replace")
         if response == "AUTH_ACCEPTED":
-            return True, buffer
+            return True, password, buffer
 
         if response.startswith("AUTH_INFO "):
             print(response[len("AUTH_INFO "):])
             raw_response, buffer = receive_line(sock, buffer)
             if raw_response is None:
                 print("Connexion fermee par le serveur.")
-                return False, buffer
+                return False, None, buffer
             response = raw_response.decode("utf-8", errors="replace")
             if response == "AUTH_ACCEPTED":
-                return True, buffer
+                return True, password, buffer
 
         if response.startswith("AUTH_RETRY "):
             print(response[len("AUTH_RETRY "):])
             continue
 
         print(f"Reponse inattendue du serveur: {response}")
-        return False, buffer
+        return False, None, buffer
+
+
+def ensure_transport_key(sock, buffer, username, password):
+    raw_response, buffer = receive_line(sock, buffer)
+    if raw_response is None:
+        print("Connexion fermee par le serveur.")
+        return None, buffer
+
+    response = raw_response.decode("utf-8", errors="replace")
+    if not response.startswith("KEY_INFO "):
+        print(f"Reponse inattendue du serveur: {response}")
+        return None, buffer
+
+    metadata = parse_transport_key_metadata(response[len("KEY_INFO "):])
+    record = build_transport_key_record_from_metadata(
+        password,
+        metadata["algorithm"],
+        metadata["cost"],
+        metadata["salt"],
+    )
+    save_transport_key_record(
+        username,
+        f"{record['algorithm']}:{record['cost']}:{record['salt']}:{record['key']}",
+    )
+    return base64.b64decode(record["key"].encode("ascii")), buffer
 
 
 def run_client(host, port):
@@ -210,8 +265,22 @@ def run_client(host, port):
         sock.close()
         return
 
-    authenticated, buffer = authenticate_password(sock, buffer)
+    authenticated, auth_password, buffer = authenticate_password(sock, buffer)
     if not authenticated:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        sock.close()
+        return
+
+    transport_key, buffer = ensure_transport_key(
+        sock,
+        buffer,
+        username,
+        auth_password,
+    )
+    if transport_key is None:
         try:
             sock.shutdown(socket.SHUT_RDWR)
         except OSError:
@@ -227,7 +296,7 @@ def run_client(host, port):
 
     receiver = threading.Thread(
         target=receive_messages,
-        args=(sock, stop_event, buffer),
+        args=(sock, stop_event, transport_key, buffer),
         daemon=True,
     )
 
@@ -249,7 +318,13 @@ def run_client(host, port):
                 continue
 
             try:
-                sock.sendall((message + "\n").encode("utf-8"))
+                if message.startswith("/"):
+                    payload = message
+                else:
+                    encrypted_message = encrypt_transport_message(message, transport_key)
+                    payload = f"ENCMSG {encrypted_message}"
+
+                sock.sendall((payload + "\n").encode("utf-8"))
             except OSError:
                 print("Impossible d'envoyer le message: connexion fermee.")
                 stop_event.set()

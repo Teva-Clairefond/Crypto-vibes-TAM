@@ -8,6 +8,15 @@ import base64
 import hmac
 import math
 import os
+from crypto_utils import (
+    build_transport_key_record,
+    decrypt_transport_message,
+    encrypt_transport_message,
+    parse_transport_key_record,
+    serialize_transport_key_record,
+    serialize_transport_key_metadata,
+    transport_key_bytes,
+)
 
 
 DEFAULT_HOST = "0.0.0.0"
@@ -32,6 +41,7 @@ LOG_FILENAME_FORMAT = "log_%Y-%m-%d_%H-%M-%S.txt"
 PROTECTED_ROOM_MARKER = "[PROTEGEE]"
 PASSWORD_STORE_FILE = "this_is_safe.txt"
 PASSWORD_RULES_FILE = "password_rules.json"
+USER_KEY_STORE_FILE = "user_keys_do_not_steal_plz.txt"
 DEFAULT_PASSWORD_RULES = {
     "min_length": 8,
     "require_uppercase": True,
@@ -50,11 +60,13 @@ rooms = {DEFAULT_ROOM: None}
 state_lock = threading.Lock()
 log_lock = threading.Lock()
 auth_lock = threading.Lock()
+key_lock = threading.Lock()
 log_file = None
 log_filename = None
 client_threads = []
 password_store = {}
 password_rules = {}
+user_key_store = {}
 
 
 def parse_port(argv):
@@ -223,6 +235,45 @@ def save_password_store():
     os.replace(temp_path, PASSWORD_STORE_FILE)
 
 
+def ensure_user_key_store_file():
+    if os.path.exists(USER_KEY_STORE_FILE):
+        return
+
+    with open(USER_KEY_STORE_FILE, "w", encoding="utf-8"):
+        pass
+
+
+def load_user_key_store():
+    ensure_user_key_store_file()
+    loaded_store = {}
+
+    with open(USER_KEY_STORE_FILE, "r", encoding="utf-8") as store_file:
+        for line in store_file:
+            line = line.strip()
+            if not line:
+                continue
+
+            parts = line.rsplit(":", 4)
+            if len(parts) != 5:
+                continue
+
+            username = parts[0]
+            loaded_store[username] = parse_transport_key_record(":".join(parts[1:]))
+
+    return loaded_store
+
+
+def save_user_key_store():
+    temp_path = f"{USER_KEY_STORE_FILE}.tmp"
+
+    with open(temp_path, "w", encoding="utf-8") as store_file:
+        for username in sorted(user_key_store):
+            serialized_record = serialize_transport_key_record(user_key_store[username])
+            store_file.write(f"{username}:{serialized_record}\n")
+
+    os.replace(temp_path, USER_KEY_STORE_FILE)
+
+
 def hash_password_md5_base64(password):
     digest = hashlib.md5(password.encode("utf-8")).digest()
     return base64.b64encode(digest).decode("ascii")
@@ -338,10 +389,18 @@ def get_auth_mode(username):
         return "REGISTER"
 
 
+def get_user_transport_key_record(username):
+    with key_lock:
+        key_record = user_key_store.get(username)
+        if key_record is None:
+            return None
+        return key_record.copy()
+
+
 def build_chat_message(username, message, color_code):
     timestamp = datetime.now().strftime("%H:%M:%S")
     colored_username = f"{color_code}{username}{ANSI_RESET}"
-    return f"[{timestamp}] {colored_username}: {message}\n".encode("utf-8")
+    return f"[{timestamp}] {colored_username}: {message}"
 
 
 def remove_client(client_socket):
@@ -402,6 +461,36 @@ def broadcast_to_room(message, room_name, excluded_socket=None):
             client_socket.sendall(message)
         except OSError:
             failed_clients.append(client_socket)
+
+    for client_socket in failed_clients:
+        remove_client(client_socket)
+
+
+def broadcast_encrypted_message_to_room(message, room_name, excluded_socket=None):
+    with state_lock:
+        recipients = [
+            (sock, info["username"])
+            for sock, info in clients.items()
+            if info["username"] is not None
+            and info["authenticated"]
+            and info["room"] == room_name
+            and sock is not excluded_socket
+        ]
+
+    failed_clients = []
+    for recipient_socket, recipient_username in recipients:
+        try:
+            key_record = get_user_transport_key_record(recipient_username)
+            if key_record is None:
+                continue
+
+            payload = encrypt_transport_message(
+                message,
+                transport_key_bytes(key_record),
+            )
+            send_line(recipient_socket, f"ENCMSG {payload}")
+        except (OSError, ValueError):
+            failed_clients.append(recipient_socket)
 
     for client_socket in failed_clients:
         remove_client(client_socket)
@@ -522,20 +611,16 @@ def authenticate_known_user(client_socket, buffer):
 
         authenticated_info = mark_client_authenticated(client_socket)
         if authenticated_info is None:
-            return False, buffer
+            return False, None, buffer
 
         send_line(client_socket, "AUTH_ACCEPTED")
-        send_line(
-            client_socket,
-            f"[server] Vous avez rejoint la room {DEFAULT_ROOM}.",
-        )
         write_log(
             "AUTH_ACCEPTED",
             client=authenticated_info["address"],
             username=authenticated_info["username"],
             room=authenticated_info["room"],
         )
-        return True, buffer
+        return True, password, buffer
 
 
 def register_new_user(client_socket, buffer):
@@ -580,15 +665,11 @@ def register_new_user(client_socket, buffer):
 
         authenticated_info = mark_client_authenticated(client_socket)
         if authenticated_info is None:
-            return False, buffer
+            return False, None, buffer
 
         password_strength = describe_password_strength(password)
         send_line(client_socket, f"AUTH_INFO Force du mot de passe: {password_strength}.")
         send_line(client_socket, "AUTH_ACCEPTED")
-        send_line(
-            client_socket,
-            f"[server] Vous avez rejoint la room {DEFAULT_ROOM}.",
-        )
         write_log(
             "ACCOUNT_CREATED",
             client=authenticated_info["address"],
@@ -602,13 +683,13 @@ def register_new_user(client_socket, buffer):
             username=authenticated_info["username"],
             room=authenticated_info["room"],
         )
-        return True, buffer
+        return True, password, buffer
 
 
 def authenticate_client(client_socket, buffer):
     client_info = get_client_snapshot(client_socket)
     if client_info is None:
-        return False, buffer
+        return False, None, buffer
 
     auth_mode = get_auth_mode(client_info["username"])
     send_line(client_socket, f"AUTH_MODE {auth_mode}")
@@ -617,6 +698,31 @@ def authenticate_client(client_socket, buffer):
         return authenticate_known_user(client_socket, buffer)
 
     return register_new_user(client_socket, buffer)
+
+
+def ensure_transport_key(client_socket, auth_password, buffer):
+    client_info = get_client_snapshot(client_socket)
+    if client_info is None:
+        return False, None, buffer
+
+    username = client_info["username"]
+    key_record = get_user_transport_key_record(username)
+    if key_record is None:
+        key_record = build_transport_key_record(auth_password)
+        with key_lock:
+            user_key_store[username] = key_record
+            save_user_key_store()
+
+        write_log(
+            "TRANSPORT_KEY_CREATED",
+            client=client_info["address"],
+            username=username,
+            algorithm=key_record["algorithm"],
+            cost=key_record["cost"],
+        )
+
+    send_line(client_socket, f"KEY_INFO {serialize_transport_key_metadata(key_record)}")
+    return True, key_record, buffer
 
 
 def get_current_room(client_socket):
@@ -737,15 +843,27 @@ def handle_client(client_socket, client_address):
     write_log("CLIENT_CONNECTED", client=format_client_address(client_address))
     username = None
     buffer = b""
+    auth_password = None
+    transport_key_record = None
 
     try:
         username, buffer = negotiate_username(client_socket)
         if username is None:
             return
 
-        authenticated, buffer = authenticate_client(client_socket, buffer)
+        authenticated, auth_password, buffer = authenticate_client(client_socket, buffer)
         if not authenticated:
             return
+
+        key_ready, transport_key_record, buffer = ensure_transport_key(
+            client_socket,
+            auth_password,
+            buffer,
+        )
+        if not key_ready:
+            return
+
+        send_line(client_socket, f"[server] Vous avez rejoint la room {DEFAULT_ROOM}.")
 
         print(f"Username accepte: {username} ({client_address[0]}:{client_address[1]})")
 
@@ -763,6 +881,10 @@ def handle_client(client_socket, client_address):
                 send_line(client_socket, response)
                 continue
 
+            if not message.startswith("ENCMSG "):
+                send_line(client_socket, "[server] Les messages doivent etre chiffres.")
+                continue
+
             room_name = get_current_room(client_socket)
             if room_name is None:
                 break
@@ -771,12 +893,21 @@ def handle_client(client_socket, client_address):
             if client_info is None:
                 break
 
+            try:
+                plaintext_message = decrypt_transport_message(
+                    message[len("ENCMSG "):],
+                    transport_key_bytes(transport_key_record),
+                )
+            except ValueError:
+                send_line(client_socket, "[server] Message chiffre invalide.")
+                continue
+
             formatted_message = build_chat_message(
                 username,
-                message,
+                plaintext_message,
                 client_info["color"],
             )
-            broadcast_to_room(
+            broadcast_encrypted_message_to_room(
                 formatted_message,
                 room_name,
                 excluded_socket=client_socket,
@@ -807,11 +938,13 @@ def handle_client(client_socket, client_address):
 def run_server(port):
     global password_rules
     global password_store
+    global user_key_store
 
     server_socket = None
     server_started = False
     password_rules = load_password_rules()
     password_store = load_password_store()
+    user_key_store = load_user_key_store()
     initialize_log_file()
     try:
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
