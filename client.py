@@ -1,4 +1,3 @@
-import queue
 import socket
 import sys
 import threading
@@ -29,41 +28,75 @@ def parse_args(argv):
     return host, port
 
 
-def receive_messages(sock, stop_event):
-    buffer = b""
+def receive_line(sock, buffer):
+    while b"\n" not in buffer:
+        data = sock.recv(BUFFER_SIZE)
+        if not data:
+            return None, buffer
+        buffer += data
+
+    raw_line, buffer = buffer.split(b"\n", 1)
+    return raw_line.rstrip(b"\r"), buffer
+
+
+def receive_messages(sock, stop_event, initial_buffer=b""):
+    buffer = initial_buffer
 
     try:
         while not stop_event.is_set():
-            data = sock.recv(BUFFER_SIZE)
-            if not data:
+            raw_message, buffer = receive_line(sock, buffer)
+            if raw_message is None:
                 print("Connexion fermee par le serveur.")
                 stop_event.set()
                 break
 
-            buffer += data
-            while b"\n" in buffer:
-                raw_message, buffer = buffer.split(b"\n", 1)
-                message = raw_message.rstrip(b"\r").decode("utf-8", errors="replace")
-                print(message, flush=True)
+            message = raw_message.decode("utf-8", errors="replace")
+            print(message, flush=True)
     except OSError:
         if not stop_event.is_set():
             print("Connexion interrompue.")
             stop_event.set()
 
 
-def read_user_input(input_queue, stop_event):
-    while not stop_event.is_set():
-        try:
-            line = sys.stdin.readline()
-        except OSError:
-            stop_event.set()
-            break
+def read_console_line(prompt):
+    print(prompt, end="", flush=True)
+    try:
+        return sys.stdin.readline()
+    except OSError:
+        return ""
 
+
+def negotiate_username(sock):
+    buffer = b""
+
+    while True:
+        line = read_console_line("Username: ")
         if line == "":
-            stop_event.set()
-            break
+            return None, buffer
 
-        input_queue.put(line)
+        proposed_username = line.rstrip("\r\n")
+
+        try:
+            sock.sendall((proposed_username + "\n").encode("utf-8"))
+        except OSError:
+            print("Impossible d'envoyer le username: connexion fermee.")
+            return None, buffer
+
+        raw_response, buffer = receive_line(sock, buffer)
+        if raw_response is None:
+            print("Connexion fermee par le serveur.")
+            return None, buffer
+
+        response = raw_response.decode("utf-8", errors="replace")
+        if response == "USERNAME_ACCEPTED":
+            return proposed_username.strip(), buffer
+
+        if response.startswith("USERNAME_REJECTED "):
+            print(response[len("USERNAME_REJECTED "):])
+            continue
+
+        print(f"Reponse inattendue du serveur: {response}")
+        return None, buffer
 
 
 def run_client(host, port):
@@ -75,29 +108,37 @@ def run_client(host, port):
 
     print(f"Connecte a {host}:{port}")
 
+    username, buffer = negotiate_username(sock)
+    if username is None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        sock.close()
+        return
+
+    print(f"Username accepte: {username}")
+
     stop_event = threading.Event()
-    input_queue = queue.Queue()
 
     receiver = threading.Thread(
         target=receive_messages,
-        args=(sock, stop_event),
-        daemon=True,
-    )
-    reader = threading.Thread(
-        target=read_user_input,
-        args=(input_queue, stop_event),
+        args=(sock, stop_event, buffer),
         daemon=True,
     )
 
     receiver.start()
-    reader.start()
 
     try:
         while not stop_event.is_set():
             try:
-                line = input_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
+                line = sys.stdin.readline()
+            except OSError:
+                stop_event.set()
+                break
+
+            if line == "":
+                break
 
             message = line.rstrip("\r\n")
             if not message:

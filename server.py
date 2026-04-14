@@ -7,7 +7,7 @@ DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 5000
 BUFFER_SIZE = 4096
 
-clients = set()
+clients = {}
 clients_lock = threading.Lock()
 
 
@@ -31,7 +31,7 @@ def parse_port(argv):
 
 def remove_client(client_socket):
     with clients_lock:
-        clients.discard(client_socket)
+        username = clients.pop(client_socket, None)
 
     try:
         client_socket.shutdown(socket.SHUT_RDWR)
@@ -43,10 +43,16 @@ def remove_client(client_socket):
     except OSError:
         pass
 
+    return username
+
 
 def broadcast(message, excluded_socket=None):
     with clients_lock:
-        recipients = [client for client in clients if client is not excluded_socket]
+        recipients = [
+            client_socket
+            for client_socket, username in clients.items()
+            if username is not None and client_socket is not excluded_socket
+        ]
 
     failed_clients = []
     for client_socket in recipients:
@@ -59,27 +65,77 @@ def broadcast(message, excluded_socket=None):
         remove_client(client_socket)
 
 
+def receive_line(client_socket, buffer):
+    while b"\n" not in buffer:
+        data = client_socket.recv(BUFFER_SIZE)
+        if not data:
+            return None, buffer
+        buffer += data
+
+    raw_line, buffer = buffer.split(b"\n", 1)
+    return raw_line.rstrip(b"\r"), buffer
+
+
+def try_register_username(client_socket, username):
+    with clients_lock:
+        if any(current_username == username for current_username in clients.values() if current_username is not None):
+            return False
+
+        clients[client_socket] = username
+        return True
+
+
+def negotiate_username(client_socket):
+    buffer = b""
+
+    while True:
+        raw_username, buffer = receive_line(client_socket, buffer)
+        if raw_username is None:
+            return None, buffer
+
+        username = raw_username.decode("utf-8", errors="replace").strip()
+
+        if not username:
+            client_socket.sendall(b"USERNAME_REJECTED Username vide.\n")
+            continue
+
+        if not try_register_username(client_socket, username):
+            client_socket.sendall(b"USERNAME_REJECTED Username deja utilise.\n")
+            continue
+
+        client_socket.sendall(b"USERNAME_ACCEPTED\n")
+        return username, buffer
+
+
 def handle_client(client_socket, client_address):
     print(f"Client connecte: {client_address[0]}:{client_address[1]}")
+    username = None
     buffer = b""
 
     try:
+        username, buffer = negotiate_username(client_socket)
+        if username is None:
+            return
+
+        print(f"Username accepte: {username} ({client_address[0]}:{client_address[1]})")
+
         while True:
-            data = client_socket.recv(BUFFER_SIZE)
-            if not data:
+            raw_message, buffer = receive_line(client_socket, buffer)
+            if raw_message is None:
                 break
 
-            buffer += data
-            while b"\n" in buffer:
-                raw_message, buffer = buffer.split(b"\n", 1)
-                message = raw_message.rstrip(b"\r")
-                if message:
-                    broadcast(message + b"\n", excluded_socket=client_socket)
+            message = raw_message.decode("utf-8", errors="replace").strip()
+            if message:
+                formatted_message = f"{username}: {message}\n".encode("utf-8")
+                broadcast(formatted_message, excluded_socket=client_socket)
     except OSError:
         pass
     finally:
-        remove_client(client_socket)
-        print(f"Client deconnecte: {client_address[0]}:{client_address[1]}")
+        released_username = remove_client(client_socket)
+        if released_username is not None:
+            print(f"Client deconnecte: {released_username} ({client_address[0]}:{client_address[1]})")
+        else:
+            print(f"Client deconnecte: {client_address[0]}:{client_address[1]}")
 
 
 def run_server(port):
@@ -94,7 +150,7 @@ def run_server(port):
         while True:
             client_socket, client_address = server_socket.accept()
             with clients_lock:
-                clients.add(client_socket)
+                clients[client_socket] = None
 
             thread = threading.Thread(
                 target=handle_client,
@@ -106,7 +162,7 @@ def run_server(port):
         print("\nArret du serveur.")
     finally:
         with clients_lock:
-            open_clients = list(clients)
+            open_clients = list(clients.keys())
             clients.clear()
 
         for client_socket in open_clients:
