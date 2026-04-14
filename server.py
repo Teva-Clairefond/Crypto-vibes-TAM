@@ -1,6 +1,7 @@
 import socket
 import sys
 import threading
+from datetime import datetime
 
 
 DEFAULT_HOST = "0.0.0.0"
@@ -33,6 +34,11 @@ def parse_port(argv):
 
 def send_line(client_socket, message):
     client_socket.sendall((message + "\n").encode("utf-8"))
+
+
+def build_chat_message(username, message):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    return f"[{timestamp}] {username}: {message}\n".encode("utf-8")
 
 
 def remove_client(client_socket):
@@ -225,7 +231,7 @@ def handle_client(client_socket, client_address):
             if room_name is None:
                 break
 
-            formatted_message = f"{username}: {message}\n".encode("utf-8")
+            formatted_message = build_chat_message(username, message)
             broadcast_to_room(
                 formatted_message,
                 room_name,
