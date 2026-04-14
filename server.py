@@ -6,9 +6,11 @@ import threading
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 5000
 BUFFER_SIZE = 4096
+DEFAULT_ROOM = "general"
 
 clients = {}
-clients_lock = threading.Lock()
+rooms = {DEFAULT_ROOM: None}
+state_lock = threading.Lock()
 
 
 def parse_port(argv):
@@ -29,9 +31,13 @@ def parse_port(argv):
     return port
 
 
+def send_line(client_socket, message):
+    client_socket.sendall((message + "\n").encode("utf-8"))
+
+
 def remove_client(client_socket):
-    with clients_lock:
-        username = clients.pop(client_socket, None)
+    with state_lock:
+        client_info = clients.pop(client_socket, None)
 
     try:
         client_socket.shutdown(socket.SHUT_RDWR)
@@ -43,15 +49,17 @@ def remove_client(client_socket):
     except OSError:
         pass
 
-    return username
+    return client_info
 
 
-def broadcast(message, excluded_socket=None):
-    with clients_lock:
+def broadcast_to_room(message, room_name, excluded_socket=None):
+    with state_lock:
         recipients = [
-            client_socket
-            for client_socket, username in clients.items()
-            if username is not None and client_socket is not excluded_socket
+            sock
+            for sock, info in clients.items()
+            if info["username"] is not None
+            and info["room"] == room_name
+            and sock is not excluded_socket
         ]
 
     failed_clients = []
@@ -77,11 +85,16 @@ def receive_line(client_socket, buffer):
 
 
 def try_register_username(client_socket, username):
-    with clients_lock:
-        if any(current_username == username for current_username in clients.values() if current_username is not None):
+    with state_lock:
+        if any(
+            info["username"] == username
+            for info in clients.values()
+            if info["username"] is not None
+        ):
             return False
 
-        clients[client_socket] = username
+        clients[client_socket]["username"] = username
+        clients[client_socket]["room"] = DEFAULT_ROOM
         return True
 
 
@@ -96,15 +109,90 @@ def negotiate_username(client_socket):
         username = raw_username.decode("utf-8", errors="replace").strip()
 
         if not username:
-            client_socket.sendall(b"USERNAME_REJECTED Username vide.\n")
+            send_line(client_socket, "USERNAME_REJECTED Username vide.")
             continue
 
         if not try_register_username(client_socket, username):
-            client_socket.sendall(b"USERNAME_REJECTED Username deja utilise.\n")
+            send_line(client_socket, "USERNAME_REJECTED Username deja utilise.")
             continue
 
-        client_socket.sendall(b"USERNAME_ACCEPTED\n")
+        send_line(client_socket, "USERNAME_ACCEPTED")
+        send_line(client_socket, f"[server] Vous avez rejoint la room {DEFAULT_ROOM}.")
         return username, buffer
+
+
+def get_current_room(client_socket):
+    with state_lock:
+        client_info = clients.get(client_socket)
+        if client_info is None:
+            return None
+        return client_info["room"]
+
+
+def create_room_and_join(client_socket, room_name, password):
+    with state_lock:
+        if room_name in rooms:
+            return False, "[server] Cette room existe deja."
+
+        rooms[room_name] = password
+        clients[client_socket]["room"] = room_name
+
+    if password is None:
+        return True, f"[server] Room creee et rejointe: {room_name}."
+
+    return True, f"[server] Room protegee creee et rejointe: {room_name}."
+
+
+def join_room(client_socket, room_name, password):
+    with state_lock:
+        if room_name not in rooms:
+            return False, "[server] Cette room n'existe pas."
+
+        room_password = rooms[room_name]
+        if room_password is not None and password != room_password:
+            return False, "[server] Mot de passe incorrect."
+
+        clients[client_socket]["room"] = room_name
+
+    return True, f"[server] Vous avez rejoint la room {room_name}."
+
+
+def process_command(client_socket, message):
+    parts = message.split()
+    command = parts[0]
+
+    if command == "/create":
+        if len(parts) not in {2, 3}:
+            return "[server] Usage: /create nom_room [motdepasse]"
+
+        room_name = parts[1].strip()
+        if not room_name:
+            return "[server] Le nom de room ne peut pas etre vide."
+
+        password = parts[2] if len(parts) == 3 else None
+        _, response = create_room_and_join(client_socket, room_name, password)
+        return response
+
+    if command == "/join":
+        if len(parts) not in {2, 3}:
+            return "[server] Usage: /join nom_room [motdepasse]"
+
+        room_name = parts[1].strip()
+        if not room_name:
+            return "[server] Le nom de room ne peut pas etre vide."
+
+        password = parts[2] if len(parts) == 3 else None
+        _, response = join_room(client_socket, room_name, password)
+        return response
+
+    if command == "/room":
+        if len(parts) != 1:
+            return "[server] Usage: /room"
+
+        room_name = get_current_room(client_socket)
+        return f"[server] Room courante: {room_name}"
+
+    return "[server] Commande inconnue."
 
 
 def handle_client(client_socket, client_address):
@@ -125,15 +213,33 @@ def handle_client(client_socket, client_address):
                 break
 
             message = raw_message.decode("utf-8", errors="replace").strip()
-            if message:
-                formatted_message = f"{username}: {message}\n".encode("utf-8")
-                broadcast(formatted_message, excluded_socket=client_socket)
+            if not message:
+                continue
+
+            if message.startswith("/"):
+                response = process_command(client_socket, message)
+                send_line(client_socket, response)
+                continue
+
+            room_name = get_current_room(client_socket)
+            if room_name is None:
+                break
+
+            formatted_message = f"{username}: {message}\n".encode("utf-8")
+            broadcast_to_room(
+                formatted_message,
+                room_name,
+                excluded_socket=client_socket,
+            )
     except OSError:
         pass
     finally:
-        released_username = remove_client(client_socket)
-        if released_username is not None:
-            print(f"Client deconnecte: {released_username} ({client_address[0]}:{client_address[1]})")
+        released_info = remove_client(client_socket)
+        if released_info is not None and released_info["username"] is not None:
+            print(
+                f"Client deconnecte: {released_info['username']} "
+                f"({client_address[0]}:{client_address[1]})"
+            )
         else:
             print(f"Client deconnecte: {client_address[0]}:{client_address[1]}")
 
@@ -149,8 +255,8 @@ def run_server(port):
     try:
         while True:
             client_socket, client_address = server_socket.accept()
-            with clients_lock:
-                clients[client_socket] = None
+            with state_lock:
+                clients[client_socket] = {"username": None, "room": None}
 
             thread = threading.Thread(
                 target=handle_client,
@@ -161,7 +267,7 @@ def run_server(port):
     except KeyboardInterrupt:
         print("\nArret du serveur.")
     finally:
-        with clients_lock:
+        with state_lock:
             open_clients = list(clients.keys())
             clients.clear()
 

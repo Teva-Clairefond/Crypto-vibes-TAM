@@ -118,6 +118,7 @@ def run_client(host, port):
         return
 
     print(f"Username accepte: {username}")
+    print("Commandes: /create nom_room [motdepasse], /join nom_room [motdepasse], /room")
 
     stop_event = threading.Event()
 
