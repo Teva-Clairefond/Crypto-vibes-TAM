@@ -25,6 +25,7 @@ ANSI_COLORS = [
     "\033[96m",
 ]
 LOG_FILENAME_FORMAT = "log_%Y-%m-%d_%H-%M-%S.txt"
+PROTECTED_ROOM_MARKER = "[PROTEGEE]"
 
 clients = {}
 rooms = {DEFAULT_ROOM: None}
@@ -147,6 +148,21 @@ def get_client_snapshot(client_socket):
         return client_info.copy()
 
 
+def is_room_protected(room_name):
+    with state_lock:
+        if room_name not in rooms:
+            return False
+
+        return rooms[room_name] is not None
+
+
+def format_room_display(room_name):
+    if is_room_protected(room_name):
+        return f"{room_name} {PROTECTED_ROOM_MARKER}"
+
+    return room_name
+
+
 def broadcast_to_room(message, room_name, excluded_socket=None):
     with state_lock:
         recipients = [
@@ -267,9 +283,9 @@ def create_room_and_join(client_socket, room_name, password):
     )
 
     if password is None:
-        return True, f"[server] Room creee et rejointe: {room_name}."
+        return True, f"[server] Room creee et rejointe: {format_room_display(room_name)}."
 
-    return True, f"[server] Room protegee creee et rejointe: {room_name}."
+    return True, f"[server] Room protegee creee et rejointe: {format_room_display(room_name)}."
 
 
 def join_room(client_socket, room_name, password):
@@ -303,7 +319,7 @@ def join_room(client_socket, room_name, password):
             to_room=room_name,
         )
 
-    return True, f"[server] Vous avez rejoint la room {room_name}."
+    return True, f"[server] Vous avez rejoint la room {format_room_display(room_name)}."
 
 
 def process_command(client_socket, message):
@@ -339,7 +355,7 @@ def process_command(client_socket, message):
             return "[server] Usage: /room"
 
         room_name = get_current_room(client_socket)
-        return f"[server] Room courante: {room_name}"
+        return f"[server] Room courante: {format_room_display(room_name)}"
 
     return "[server] Commande inconnue."
 
