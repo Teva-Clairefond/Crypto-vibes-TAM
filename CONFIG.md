@@ -11,6 +11,7 @@
 
 - `server.py` : logique serveur.
 - `client.py` : logique client console.
+- `AGENTS.md` : organisation de la team d'agents.
 - `README.md` : documentation generale actuelle.
 - `compte_rendu_tests_etape_1.md` : ancien compte rendu de la premiere etape.
 
@@ -28,6 +29,7 @@
 - Les valeurs modifiables doivent vivre dans des constantes ou fichiers simples.
 - Les regles de mot de passe ne doivent pas etre codees en dur si le sujet demande un fichier a part.
 - Les artefacts de test et de logs doivent rester separables des fichiers sources.
+- Le decoupage fin des sous-etapes doit rester synchronise avec `ORCHESTRATION.md`.
 
 ## Hypotheses techniques
 
