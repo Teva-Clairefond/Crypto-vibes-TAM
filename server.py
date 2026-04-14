@@ -4,13 +4,16 @@ import threading
 from datetime import datetime
 import hashlib
 import json
+import base64
+import hmac
+import math
+import os
 
 
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 5000
 BUFFER_SIZE = 4096
 DEFAULT_ROOM = "general"
-CHAT_PASSWORD = "crypto-vibes"
 ANSI_RESET = "\033[0m"
 ANSI_COLORS = [
     "\033[31m",
@@ -27,14 +30,25 @@ ANSI_COLORS = [
 ]
 LOG_FILENAME_FORMAT = "log_%Y-%m-%d_%H-%M-%S.txt"
 PROTECTED_ROOM_MARKER = "[PROTEGEE]"
+PASSWORD_STORE_FILE = "this_is_safe.txt"
+PASSWORD_RULES_FILE = "password_rules.json"
+DEFAULT_PASSWORD_RULES = {
+    "min_length": 8,
+    "require_uppercase": True,
+    "require_lowercase": True,
+    "require_digit": True,
+}
 
 clients = {}
 rooms = {DEFAULT_ROOM: None}
 state_lock = threading.Lock()
 log_lock = threading.Lock()
+auth_lock = threading.Lock()
 log_file = None
 log_filename = None
 client_threads = []
+password_store = {}
+password_rules = {}
 
 
 def parse_port(argv):
@@ -115,6 +129,146 @@ def send_line(client_socket, message):
 def get_username_color(username):
     digest = hashlib.sha256(username.encode("utf-8")).digest()
     return ANSI_COLORS[digest[0] % len(ANSI_COLORS)]
+
+
+def ensure_password_rules_file():
+    if os.path.exists(PASSWORD_RULES_FILE):
+        return
+
+    with open(PASSWORD_RULES_FILE, "w", encoding="utf-8") as rules_file:
+        json.dump(DEFAULT_PASSWORD_RULES, rules_file, indent=2)
+
+
+def load_password_rules():
+    ensure_password_rules_file()
+
+    with open(PASSWORD_RULES_FILE, "r", encoding="utf-8") as rules_file:
+        loaded_rules = json.load(rules_file)
+
+    return {
+        "min_length": int(loaded_rules.get("min_length", DEFAULT_PASSWORD_RULES["min_length"])),
+        "require_uppercase": bool(
+            loaded_rules.get(
+                "require_uppercase",
+                DEFAULT_PASSWORD_RULES["require_uppercase"],
+            )
+        ),
+        "require_lowercase": bool(
+            loaded_rules.get(
+                "require_lowercase",
+                DEFAULT_PASSWORD_RULES["require_lowercase"],
+            )
+        ),
+        "require_digit": bool(
+            loaded_rules.get(
+                "require_digit",
+                DEFAULT_PASSWORD_RULES["require_digit"],
+            )
+        ),
+    }
+
+
+def ensure_password_store_file():
+    if os.path.exists(PASSWORD_STORE_FILE):
+        return
+
+    with open(PASSWORD_STORE_FILE, "w", encoding="utf-8"):
+        pass
+
+
+def load_password_store():
+    ensure_password_store_file()
+    loaded_store = {}
+
+    with open(PASSWORD_STORE_FILE, "r", encoding="utf-8") as store_file:
+        for line in store_file:
+            line = line.strip()
+            if not line:
+                continue
+
+            username, stored_hash = line.split(":", 1)
+            loaded_store[username] = stored_hash
+
+    return loaded_store
+
+
+def save_password_store():
+    temp_path = f"{PASSWORD_STORE_FILE}.tmp"
+
+    with open(temp_path, "w", encoding="utf-8") as store_file:
+        for username in sorted(password_store):
+            store_file.write(f"{username}:{password_store[username]}\n")
+
+    os.replace(temp_path, PASSWORD_STORE_FILE)
+
+
+def hash_password_md5_base64(password):
+    digest = hashlib.md5(password.encode("utf-8")).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+def verify_password_constant_time(password, stored_hash):
+    candidate_hash = hash_password_md5_base64(password)
+    return hmac.compare_digest(
+        candidate_hash.encode("ascii"),
+        stored_hash.encode("ascii"),
+    )
+
+
+def validate_password_rules(password):
+    errors = []
+
+    if len(password) < password_rules["min_length"]:
+        errors.append(
+            f"Le mot de passe doit contenir au moins {password_rules['min_length']} caracteres."
+        )
+
+    if password_rules["require_uppercase"] and not any(char.isupper() for char in password):
+        errors.append("Le mot de passe doit contenir au moins une majuscule.")
+
+    if password_rules["require_lowercase"] and not any(char.islower() for char in password):
+        errors.append("Le mot de passe doit contenir au moins une minuscule.")
+
+    if password_rules["require_digit"] and not any(char.isdigit() for char in password):
+        errors.append("Le mot de passe doit contenir au moins un chiffre.")
+
+    return errors
+
+
+def estimate_password_entropy(password):
+    charset_size = 0
+    if any(char.islower() for char in password):
+        charset_size += 26
+    if any(char.isupper() for char in password):
+        charset_size += 26
+    if any(char.isdigit() for char in password):
+        charset_size += 10
+    if any(not char.isalnum() for char in password):
+        charset_size += 32
+
+    if charset_size == 0:
+        return 0.0
+
+    return len(password) * math.log2(charset_size)
+
+
+def describe_password_strength(password):
+    entropy = estimate_password_entropy(password)
+    if entropy < 40:
+        label = "faible"
+    elif entropy < 60:
+        label = "moyenne"
+    else:
+        label = "forte"
+
+    return f"{label} ({entropy:.1f} bits)"
+
+
+def get_auth_mode(username):
+    with auth_lock:
+        if username in password_store:
+            return "LOGIN"
+        return "REGISTER"
 
 
 def build_chat_message(username, message, color_code):
@@ -259,7 +413,7 @@ def negotiate_username(client_socket):
         return username, buffer
 
 
-def authenticate_client(client_socket, buffer):
+def authenticate_known_user(client_socket, buffer):
     while True:
         raw_password, buffer = receive_line(client_socket, buffer)
         if raw_password is None:
@@ -270,13 +424,20 @@ def authenticate_client(client_socket, buffer):
         client_address = None if client_info is None else client_info["address"]
         username = None if client_info is None else client_info["username"]
 
-        if password != CHAT_PASSWORD:
+        with auth_lock:
+            stored_hash = password_store.get(username)
+
+        if stored_hash is None:
+            send_line(client_socket, "AUTH_RETRY Compte introuvable.")
+            return False, buffer
+
+        if not verify_password_constant_time(password, stored_hash):
             write_log(
                 "AUTH_REJECTED",
                 client=client_address,
                 username=username,
             )
-            send_line(client_socket, "AUTH_REJECTED Mot de passe incorrect.")
+            send_line(client_socket, "AUTH_RETRY Mot de passe incorrect.")
             continue
 
         authenticated_info = mark_client_authenticated(client_socket)
@@ -295,6 +456,85 @@ def authenticate_client(client_socket, buffer):
             room=authenticated_info["room"],
         )
         return True, buffer
+
+
+def register_new_user(client_socket, buffer):
+    while True:
+        raw_password, buffer = receive_line(client_socket, buffer)
+        if raw_password is None:
+            return False, buffer
+
+        raw_confirmation, buffer = receive_line(client_socket, buffer)
+        if raw_confirmation is None:
+            return False, buffer
+
+        password = raw_password.decode("utf-8", errors="replace").strip()
+        confirmation = raw_confirmation.decode("utf-8", errors="replace").strip()
+        client_info = get_client_snapshot(client_socket)
+        client_address = None if client_info is None else client_info["address"]
+        username = None if client_info is None else client_info["username"]
+
+        if password != confirmation:
+            write_log(
+                "ACCOUNT_REJECTED_CONFIRMATION",
+                client=client_address,
+                username=username,
+            )
+            send_line(client_socket, "AUTH_RETRY Les mots de passe ne correspondent pas.")
+            continue
+
+        rule_errors = validate_password_rules(password)
+        if rule_errors:
+            write_log(
+                "ACCOUNT_REJECTED_RULES",
+                client=client_address,
+                username=username,
+            )
+            send_line(client_socket, f"AUTH_RETRY {' '.join(rule_errors)}")
+            continue
+
+        stored_hash = hash_password_md5_base64(password)
+        with auth_lock:
+            password_store[username] = stored_hash
+            save_password_store()
+
+        authenticated_info = mark_client_authenticated(client_socket)
+        if authenticated_info is None:
+            return False, buffer
+
+        password_strength = describe_password_strength(password)
+        send_line(client_socket, f"AUTH_INFO Force du mot de passe: {password_strength}.")
+        send_line(client_socket, "AUTH_ACCEPTED")
+        send_line(
+            client_socket,
+            f"[server] Vous avez rejoint la room {DEFAULT_ROOM}.",
+        )
+        write_log(
+            "ACCOUNT_CREATED",
+            client=authenticated_info["address"],
+            username=authenticated_info["username"],
+        )
+        write_log(
+            "AUTH_ACCEPTED",
+            client=authenticated_info["address"],
+            username=authenticated_info["username"],
+            room=authenticated_info["room"],
+        )
+        return True, buffer
+
+
+def authenticate_client(client_socket, buffer):
+    client_info = get_client_snapshot(client_socket)
+    if client_info is None:
+        return False, buffer
+
+    auth_mode = get_auth_mode(client_info["username"])
+    send_line(client_socket, f"AUTH_MODE {auth_mode}")
+
+    if auth_mode == "LOGIN":
+        return authenticate_known_user(client_socket, buffer)
+
+    return register_new_user(client_socket, buffer)
 
 
 def get_current_room(client_socket):
@@ -483,8 +723,13 @@ def handle_client(client_socket, client_address):
 
 
 def run_server(port):
+    global password_rules
+    global password_store
+
     server_socket = None
     server_started = False
+    password_rules = load_password_rules()
+    password_store = load_password_store()
     initialize_log_file()
     try:
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

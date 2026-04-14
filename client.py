@@ -118,18 +118,52 @@ def negotiate_username(sock):
 
 
 def authenticate_password(sock, buffer):
+    raw_mode, buffer = receive_line(sock, buffer)
+    if raw_mode is None:
+        print("Connexion fermee par le serveur.")
+        return False, buffer
+
+    auth_mode_response = raw_mode.decode("utf-8", errors="replace")
+    if auth_mode_response == "AUTH_MODE LOGIN":
+        auth_mode = "LOGIN"
+    elif auth_mode_response == "AUTH_MODE REGISTER":
+        auth_mode = "REGISTER"
+        print("Nouveau compte detecte. Creation du mot de passe.")
+    else:
+        print(f"Reponse inattendue du serveur: {auth_mode_response}")
+        return False, buffer
+
     while True:
-        line = read_console_line("Password: ")
-        if line == "":
-            return False, buffer
+        if auth_mode == "LOGIN":
+            line = read_console_line("Password: ")
+            if line == "":
+                return False, buffer
 
-        password = line.rstrip("\r\n")
+            password = line.rstrip("\r\n")
 
-        try:
-            sock.sendall((password + "\n").encode("utf-8"))
-        except OSError:
-            print("Impossible d'envoyer le mot de passe: connexion fermee.")
-            return False, buffer
+            try:
+                sock.sendall((password + "\n").encode("utf-8"))
+            except OSError:
+                print("Impossible d'envoyer le mot de passe: connexion fermee.")
+                return False, buffer
+        else:
+            password_line = read_console_line("New password: ")
+            if password_line == "":
+                return False, buffer
+
+            confirmation_line = read_console_line("Confirm password: ")
+            if confirmation_line == "":
+                return False, buffer
+
+            password = password_line.rstrip("\r\n")
+            confirmation = confirmation_line.rstrip("\r\n")
+
+            try:
+                sock.sendall((password + "\n").encode("utf-8"))
+                sock.sendall((confirmation + "\n").encode("utf-8"))
+            except OSError:
+                print("Impossible d'envoyer le mot de passe: connexion fermee.")
+                return False, buffer
 
         raw_response, buffer = receive_line(sock, buffer)
         if raw_response is None:
@@ -140,8 +174,18 @@ def authenticate_password(sock, buffer):
         if response == "AUTH_ACCEPTED":
             return True, buffer
 
-        if response.startswith("AUTH_REJECTED "):
-            print(response[len("AUTH_REJECTED "):])
+        if response.startswith("AUTH_INFO "):
+            print(response[len("AUTH_INFO "):])
+            raw_response, buffer = receive_line(sock, buffer)
+            if raw_response is None:
+                print("Connexion fermee par le serveur.")
+                return False, buffer
+            response = raw_response.decode("utf-8", errors="replace")
+            if response == "AUTH_ACCEPTED":
+                return True, buffer
+
+        if response.startswith("AUTH_RETRY "):
+            print(response[len("AUTH_RETRY "):])
             continue
 
         print(f"Reponse inattendue du serveur: {response}")
