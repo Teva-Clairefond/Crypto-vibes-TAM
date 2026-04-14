@@ -3,6 +3,7 @@ import sys
 import threading
 from datetime import datetime
 import hashlib
+import json
 
 
 DEFAULT_HOST = "0.0.0.0"
@@ -23,10 +24,15 @@ ANSI_COLORS = [
     "\033[95m",
     "\033[96m",
 ]
+LOG_FILENAME_FORMAT = "log_%Y-%m-%d_%H-%M-%S.txt"
 
 clients = {}
 rooms = {DEFAULT_ROOM: None}
 state_lock = threading.Lock()
+log_lock = threading.Lock()
+log_file = None
+log_filename = None
+client_threads = []
 
 
 def parse_port(argv):
@@ -45,6 +51,59 @@ def parse_port(argv):
         raise ValueError("Le port doit etre compris entre 1 et 65535.")
 
     return port
+
+
+def initialize_log_file():
+    global log_file
+    global log_filename
+
+    base_filename = datetime.now().strftime(LOG_FILENAME_FORMAT)
+    candidate = base_filename
+    suffix = 1
+
+    while True:
+        try:
+            log_file = open(candidate, "x", encoding="utf-8")
+            log_filename = candidate
+            return log_filename
+        except FileExistsError:
+            stem, extension = base_filename.rsplit(".", 1)
+            candidate = f"{stem}-{suffix}.{extension}"
+            suffix += 1
+
+
+def close_log_file():
+    global log_file
+
+    with log_lock:
+        if log_file is None:
+            return
+
+        log_file.flush()
+        log_file.close()
+        log_file = None
+
+
+def write_log(event, **fields):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    parts = [f"[{timestamp}]", event]
+
+    for key, value in fields.items():
+        if value is not None:
+            parts.append(f"{key}={json.dumps(value, ensure_ascii=False)}")
+
+    line = " ".join(parts)
+
+    with log_lock:
+        if log_file is None:
+            return
+
+        log_file.write(line + "\n")
+        log_file.flush()
+
+
+def format_client_address(client_address):
+    return f"{client_address[0]}:{client_address[1]}"
 
 
 def send_line(client_socket, message):
@@ -77,6 +136,15 @@ def remove_client(client_socket):
         pass
 
     return client_info
+
+
+def get_client_snapshot(client_socket):
+    with state_lock:
+        client_info = clients.get(client_socket)
+        if client_info is None:
+            return None
+
+        return client_info.copy()
 
 
 def broadcast_to_room(message, room_name, excluded_socket=None):
@@ -135,17 +203,31 @@ def negotiate_username(client_socket):
             return None, buffer
 
         username = raw_username.decode("utf-8", errors="replace").strip()
+        client_info = get_client_snapshot(client_socket)
+        client_address = None if client_info is None else client_info["address"]
 
         if not username:
+            write_log("USERNAME_REJECTED_EMPTY", client=client_address)
             send_line(client_socket, "USERNAME_REJECTED Username vide.")
             continue
 
         if not try_register_username(client_socket, username):
+            write_log(
+                "USERNAME_REJECTED_DUPLICATE",
+                client=client_address,
+                username=username,
+            )
             send_line(client_socket, "USERNAME_REJECTED Username deja utilise.")
             continue
 
         send_line(client_socket, "USERNAME_ACCEPTED")
         send_line(client_socket, f"[server] Vous avez rejoint la room {DEFAULT_ROOM}.")
+        write_log(
+            "USERNAME_ACCEPTED",
+            client=client_address,
+            username=username,
+            room=DEFAULT_ROOM,
+        )
         return username, buffer
 
 
@@ -162,8 +244,27 @@ def create_room_and_join(client_socket, room_name, password):
         if room_name in rooms:
             return False, "[server] Cette room existe deja."
 
+        client_info = clients[client_socket]
+        previous_room = client_info["room"]
+        username = client_info["username"]
+        client_address = client_info["address"]
         rooms[room_name] = password
-        clients[client_socket]["room"] = room_name
+        client_info["room"] = room_name
+
+    write_log(
+        "ROOM_CREATED",
+        client=client_address,
+        username=username,
+        room=room_name,
+        protected="yes" if password is not None else "no",
+    )
+    write_log(
+        "ROOM_CHANGED",
+        client=client_address,
+        username=username,
+        from_room=previous_room,
+        to_room=room_name,
+    )
 
     if password is None:
         return True, f"[server] Room creee et rejointe: {room_name}."
@@ -173,14 +274,34 @@ def create_room_and_join(client_socket, room_name, password):
 
 def join_room(client_socket, room_name, password):
     with state_lock:
+        client_info = clients[client_socket]
+        previous_room = client_info["room"]
+        username = client_info["username"]
+        client_address = client_info["address"]
+
         if room_name not in rooms:
             return False, "[server] Cette room n'existe pas."
 
         room_password = rooms[room_name]
         if room_password is not None and password != room_password:
+            write_log(
+                "ROOM_JOIN_REJECTED_BAD_PASSWORD",
+                client=client_address,
+                username=username,
+                room=room_name,
+            )
             return False, "[server] Mot de passe incorrect."
 
-        clients[client_socket]["room"] = room_name
+        client_info["room"] = room_name
+
+    if previous_room != room_name:
+        write_log(
+            "ROOM_CHANGED",
+            client=client_address,
+            username=username,
+            from_room=previous_room,
+            to_room=room_name,
+        )
 
     return True, f"[server] Vous avez rejoint la room {room_name}."
 
@@ -225,6 +346,7 @@ def process_command(client_socket, message):
 
 def handle_client(client_socket, client_address):
     print(f"Client connecte: {client_address[0]}:{client_address[1]}")
+    write_log("CLIENT_CONNECTED", client=format_client_address(client_address))
     username = None
     buffer = b""
 
@@ -253,10 +375,14 @@ def handle_client(client_socket, client_address):
             if room_name is None:
                 break
 
+            client_info = get_client_snapshot(client_socket)
+            if client_info is None:
+                break
+
             formatted_message = build_chat_message(
                 username,
                 message,
-                clients[client_socket]["color"],
+                client_info["color"],
             )
             broadcast_to_room(
                 formatted_message,
@@ -268,40 +394,65 @@ def handle_client(client_socket, client_address):
     finally:
         released_info = remove_client(client_socket)
         if released_info is not None and released_info["username"] is not None:
+            write_log(
+                "CLIENT_DISCONNECTED",
+                client=released_info["address"],
+                username=released_info["username"],
+                room=released_info["room"],
+            )
             print(
                 f"Client deconnecte: {released_info['username']} "
                 f"({client_address[0]}:{client_address[1]})"
             )
         else:
+            write_log(
+                "CLIENT_DISCONNECTED",
+                client=format_client_address(client_address),
+            )
             print(f"Client deconnecte: {client_address[0]}:{client_address[1]}")
 
 
 def run_server(port):
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind((DEFAULT_HOST, port))
-    server_socket.listen()
-
-    print(f"Serveur en ecoute sur le port {port}")
-
+    server_socket = None
+    server_started = False
+    initialize_log_file()
     try:
-        while True:
-            client_socket, client_address = server_socket.accept()
-            with state_lock:
-                clients[client_socket] = {"username": None, "room": None, "color": None}
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.bind((DEFAULT_HOST, port))
+        server_socket.listen()
 
-            thread = threading.Thread(
-                target=handle_client,
-                args=(client_socket, client_address),
-                daemon=True,
-            )
-            thread.start()
-    except KeyboardInterrupt:
-        print("\nArret du serveur.")
+        server_started = True
+        write_log("SERVER_STARTED", port=port, log_file=log_filename)
+        print(f"Serveur en ecoute sur le port {port}")
+
+        try:
+            while True:
+                client_socket, client_address = server_socket.accept()
+                with state_lock:
+                    clients[client_socket] = {
+                        "username": None,
+                        "room": None,
+                        "color": None,
+                        "address": format_client_address(client_address),
+                    }
+
+                thread = threading.Thread(
+                    target=handle_client,
+                    args=(client_socket, client_address),
+                    daemon=True,
+                )
+                thread.start()
+                with state_lock:
+                    client_threads.append(thread)
+        except KeyboardInterrupt:
+            print("\nArret du serveur.")
     finally:
         with state_lock:
             open_clients = list(clients.keys())
             clients.clear()
+            threads_to_join = list(client_threads)
+            client_threads.clear()
 
         for client_socket in open_clients:
             try:
@@ -313,7 +464,16 @@ def run_server(port):
             except OSError:
                 pass
 
-        server_socket.close()
+        if server_socket is not None:
+            server_socket.close()
+
+        for thread in threads_to_join:
+            thread.join()
+
+        if server_started:
+            write_log("SERVER_STOPPED")
+
+        close_log_file()
 
 
 def main():
