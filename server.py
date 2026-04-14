@@ -10,6 +10,7 @@ DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 5000
 BUFFER_SIZE = 4096
 DEFAULT_ROOM = "general"
+CHAT_PASSWORD = "crypto-vibes"
 ANSI_RESET = "\033[0m"
 ANSI_COLORS = [
     "\033[31m",
@@ -169,6 +170,7 @@ def broadcast_to_room(message, room_name, excluded_socket=None):
             sock
             for sock, info in clients.items()
             if info["username"] is not None
+            and info["authenticated"]
             and info["room"] == room_name
             and sock is not excluded_socket
         ]
@@ -205,9 +207,21 @@ def try_register_username(client_socket, username):
             return False
 
         clients[client_socket]["username"] = username
-        clients[client_socket]["room"] = DEFAULT_ROOM
+        clients[client_socket]["room"] = None
         clients[client_socket]["color"] = get_username_color(username)
+        clients[client_socket]["authenticated"] = False
         return True
+
+
+def mark_client_authenticated(client_socket):
+    with state_lock:
+        client_info = clients.get(client_socket)
+        if client_info is None:
+            return None
+
+        client_info["authenticated"] = True
+        client_info["room"] = DEFAULT_ROOM
+        return client_info.copy()
 
 
 def negotiate_username(client_socket):
@@ -237,14 +251,50 @@ def negotiate_username(client_socket):
             continue
 
         send_line(client_socket, "USERNAME_ACCEPTED")
-        send_line(client_socket, f"[server] Vous avez rejoint la room {DEFAULT_ROOM}.")
         write_log(
             "USERNAME_ACCEPTED",
             client=client_address,
             username=username,
-            room=DEFAULT_ROOM,
         )
         return username, buffer
+
+
+def authenticate_client(client_socket, buffer):
+    while True:
+        raw_password, buffer = receive_line(client_socket, buffer)
+        if raw_password is None:
+            return False, buffer
+
+        password = raw_password.decode("utf-8", errors="replace").strip()
+        client_info = get_client_snapshot(client_socket)
+        client_address = None if client_info is None else client_info["address"]
+        username = None if client_info is None else client_info["username"]
+
+        if password != CHAT_PASSWORD:
+            write_log(
+                "AUTH_REJECTED",
+                client=client_address,
+                username=username,
+            )
+            send_line(client_socket, "AUTH_REJECTED Mot de passe incorrect.")
+            continue
+
+        authenticated_info = mark_client_authenticated(client_socket)
+        if authenticated_info is None:
+            return False, buffer
+
+        send_line(client_socket, "AUTH_ACCEPTED")
+        send_line(
+            client_socket,
+            f"[server] Vous avez rejoint la room {DEFAULT_ROOM}.",
+        )
+        write_log(
+            "AUTH_ACCEPTED",
+            client=authenticated_info["address"],
+            username=authenticated_info["username"],
+            room=authenticated_info["room"],
+        )
+        return True, buffer
 
 
 def get_current_room(client_socket):
@@ -371,6 +421,10 @@ def handle_client(client_socket, client_address):
         if username is None:
             return
 
+        authenticated, buffer = authenticate_client(client_socket, buffer)
+        if not authenticated:
+            return
+
         print(f"Username accepte: {username} ({client_address[0]}:{client_address[1]})")
 
         while True:
@@ -450,6 +504,7 @@ def run_server(port):
                         "username": None,
                         "room": None,
                         "color": None,
+                        "authenticated": False,
                         "address": format_client_address(client_address),
                     }
 

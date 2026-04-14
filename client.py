@@ -117,6 +117,37 @@ def negotiate_username(sock):
         return None, buffer
 
 
+def authenticate_password(sock, buffer):
+    while True:
+        line = read_console_line("Password: ")
+        if line == "":
+            return False, buffer
+
+        password = line.rstrip("\r\n")
+
+        try:
+            sock.sendall((password + "\n").encode("utf-8"))
+        except OSError:
+            print("Impossible d'envoyer le mot de passe: connexion fermee.")
+            return False, buffer
+
+        raw_response, buffer = receive_line(sock, buffer)
+        if raw_response is None:
+            print("Connexion fermee par le serveur.")
+            return False, buffer
+
+        response = raw_response.decode("utf-8", errors="replace")
+        if response == "AUTH_ACCEPTED":
+            return True, buffer
+
+        if response.startswith("AUTH_REJECTED "):
+            print(response[len("AUTH_REJECTED "):])
+            continue
+
+        print(f"Reponse inattendue du serveur: {response}")
+        return False, buffer
+
+
 def run_client(host, port):
     try:
         sock = socket.create_connection((host, port))
@@ -135,7 +166,17 @@ def run_client(host, port):
         sock.close()
         return
 
+    authenticated, buffer = authenticate_password(sock, buffer)
+    if not authenticated:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        sock.close()
+        return
+
     print(f"Username accepte: {username}")
+    print("Authentification reussie.")
     print("Commandes: /create nom_room [motdepasse], /join nom_room [motdepasse], /room")
 
     stop_event = threading.Event()
