@@ -2,12 +2,27 @@ import socket
 import sys
 import threading
 from datetime import datetime
+import hashlib
 
 
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 5000
 BUFFER_SIZE = 4096
 DEFAULT_ROOM = "general"
+ANSI_RESET = "\033[0m"
+ANSI_COLORS = [
+    "\033[31m",
+    "\033[32m",
+    "\033[33m",
+    "\033[34m",
+    "\033[35m",
+    "\033[36m",
+    "\033[91m",
+    "\033[92m",
+    "\033[94m",
+    "\033[95m",
+    "\033[96m",
+]
 
 clients = {}
 rooms = {DEFAULT_ROOM: None}
@@ -36,9 +51,15 @@ def send_line(client_socket, message):
     client_socket.sendall((message + "\n").encode("utf-8"))
 
 
-def build_chat_message(username, message):
+def get_username_color(username):
+    digest = hashlib.sha256(username.encode("utf-8")).digest()
+    return ANSI_COLORS[digest[0] % len(ANSI_COLORS)]
+
+
+def build_chat_message(username, message, color_code):
     timestamp = datetime.now().strftime("%H:%M:%S")
-    return f"[{timestamp}] {username}: {message}\n".encode("utf-8")
+    colored_username = f"{color_code}{username}{ANSI_RESET}"
+    return f"[{timestamp}] {colored_username}: {message}\n".encode("utf-8")
 
 
 def remove_client(client_socket):
@@ -101,6 +122,7 @@ def try_register_username(client_socket, username):
 
         clients[client_socket]["username"] = username
         clients[client_socket]["room"] = DEFAULT_ROOM
+        clients[client_socket]["color"] = get_username_color(username)
         return True
 
 
@@ -231,7 +253,11 @@ def handle_client(client_socket, client_address):
             if room_name is None:
                 break
 
-            formatted_message = build_chat_message(username, message)
+            formatted_message = build_chat_message(
+                username,
+                message,
+                clients[client_socket]["color"],
+            )
             broadcast_to_room(
                 formatted_message,
                 room_name,
@@ -262,7 +288,7 @@ def run_server(port):
         while True:
             client_socket, client_address = server_socket.accept()
             with state_lock:
-                clients[client_socket] = {"username": None, "room": None}
+                clients[client_socket] = {"username": None, "room": None, "color": None}
 
             thread = threading.Thread(
                 target=handle_client,

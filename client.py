@@ -1,3 +1,4 @@
+import ctypes
 import socket
 import sys
 import threading
@@ -26,6 +27,23 @@ def parse_args(argv):
         raise ValueError("Le port doit etre compris entre 1 et 65535.")
 
     return host, port
+
+
+def enable_ansi_colors():
+    if sys.platform != "win32":
+        return
+
+    try:
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)
+        if handle in (0, -1):
+            return
+
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+    except Exception:
+        pass
 
 
 def receive_line(sock, buffer):
@@ -162,6 +180,8 @@ def run_client(host, port):
 
 
 def main():
+    enable_ansi_colors()
+
     try:
         host, port = parse_args(sys.argv)
     except ValueError as error:
