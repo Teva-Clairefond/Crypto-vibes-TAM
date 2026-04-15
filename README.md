@@ -1,65 +1,54 @@
 # Crypto Vibes
 
-Projet de chat multi-utilisateurs type IRC en Python, réalisé par étapes.
+Projet de chat multi-utilisateurs en Python realise par etapes, avec progression depuis un chat TCP simple jusqu'a un chat avec authentification, chiffrement de transport et messages prives E2EE signes.
 
-Le projet final doit fournir un serveur et un client de chat sans authentification ni chiffrement, avec des usernames uniques, des rooms, des rooms protégées par mot de passe, des couleurs déterministes et des logs côté serveur.
-
-## Etat actuel
-
-Cette version du dépôt couvre uniquement l'étape 1 :
+## Fonctionnalites
 
 - serveur TCP multi-clients ;
-- client TCP ;
-- port configurable en ligne de commande ;
-- port par défaut si aucun argument n'est fourni ;
-- diffusion des messages à tous les autres clients connectés ;
-- gestion propre des déconnexions.
-
-Les fonctionnalités suivantes ne sont pas encore implémentées :
-
-- usernames ;
-- rooms ;
-- room `general` ;
-- mots de passe ;
-- couleurs ;
-- timestamps ;
-- logs ;
-- authentification ;
-- chiffrement ;
-- commandes IRC.
+- usernames uniques sur les connexions actives ;
+- authentification utilisateur avec enregistrement et reconnexion ;
+- regles de mots de passe chargees depuis `password_rules.json` ;
+- stockage des mots de passe dans `this_is_safe.txt` avec `scrypt` et migration des anciens formats ;
+- rooms avec `general` par defaut ;
+- rooms protegees par mot de passe ;
+- affichage distinctif des rooms protegees ;
+- timestamps sur les messages de chat ;
+- couleur deterministe par username ;
+- logs serveur horodates dans `log_YYYY-MM-DD_HH-MM-SS.txt` ;
+- paire RSA locale par utilisateur ;
+- chiffrement du transport client-serveur par cle de session ;
+- annuaire des cles publiques des utilisateurs authentifies ;
+- stockage local des cles publiques connues ;
+- messages prives 1-1 chiffrés de bout en bout ;
+- signature et verification des messages prives ;
+- rejet visible des messages prives alteres.
 
 ## Structure
 
-- `server.py` : serveur de chat TCP.
-- `client.py` : client de chat TCP.
+- `server.py` : serveur principal.
+- `client.py` : client console.
+- `crypto_utils.py` : chiffrement symetrique et utilitaires bloc/KDF.
+- `asymmetric_utils.py` : utilitaires RSA.
+- `password_rules.json` : regles de mot de passe.
+- `this_is_safe.txt` : base des mots de passe.
+- `md5_yolo.txt` et `md5_decrypted.txt` : artefacts de la partie hash.
 
-## Prérequis
+## Prerequis
 
-- Python 3.10 ou supérieur recommandé
-- aucune dépendance externe
+- Python 3.10 ou plus recent recommande.
+- dependance Python :
+
+```bash
+pip install -r requirements.txt
+```
 
 ## Lancement
 
-Important :
-
-- les commandes ci-dessous doivent etre executees depuis le dossier `Crypto-vibes-TAM` ;
-- si vous etes dans le dossier parent `29_Crypto_Vibes`, commencez par :
-
-```bash
-cd Crypto-vibes-TAM
-```
-
-- alternative sans changer de dossier :
-
-```bash
-python Crypto-vibes-TAM/server.py 5051
-python Crypto-vibes-TAM/client.py 127.0.0.1 5051
-```
-
-### Serveur
+Depuis le dossier `Crypto-vibes-TAM` :
 
 ```bash
 python server.py [port]
+python client.py [host] [port]
 ```
 
 Exemples :
@@ -67,89 +56,67 @@ Exemples :
 ```bash
 python server.py
 python server.py 5051
-```
-
-Comportement :
-
-- si aucun port n'est fourni, le serveur écoute sur le port par défaut `5000` ;
-- le serveur écoute sur toutes les interfaces réseau via `0.0.0.0`.
-
-### Client
-
-```bash
-python client.py [host] [port]
-```
-
-Exemples :
-
-```bash
 python client.py
-python client.py 127.0.0.1
-python client.py 127.0.0.1 5000
 python client.py 127.0.0.1 5051
 ```
 
-Comportement :
+Valeurs par defaut :
 
-- si aucun `host` n'est fourni, le client utilise `127.0.0.1` ;
-- si aucun `port` n'est fourni, le client utilise le port par défaut `5000`.
+- serveur : port `5000`
+- client : host `127.0.0.1`, port `5000`
 
 ## Utilisation
 
-1. Ouvrir un premier terminal et lancer le serveur.
-2. Ouvrir deux ou trois autres terminaux et lancer un client dans chacun.
-3. Taper un message dans un client puis valider avec Entrée.
-4. Vérifier que le message s'affiche immédiatement chez les autres clients connectés, sans echo chez l'émetteur.
-5. Fermer un client et vérifier que le serveur continue à fonctionner.
-6. Arrêter le serveur et vérifier que les clients détectent la fermeture de connexion.
+Au premier lancement avec un username inconnu :
 
-## Exemple de session locale
+1. saisir un username ;
+2. creer un mot de passe conforme aux regles ;
+3. le client genere ou recharge sa paire `identity.priv` / `identity.pub`.
 
-Terminal 1 :
+Aux lancements suivants :
 
-```bash
-python server.py
-```
+1. saisir le meme username ;
+2. saisir le mot de passe ;
+3. la connexion reprend avec la meme identite locale.
 
-Terminal 2 :
+## Commandes
 
-```bash
-python client.py
-```
+Commandes de chat de room :
 
-Terminal 3 :
+- `/create nom_room`
+- `/create nom_room motdepasse`
+- `/join nom_room`
+- `/join nom_room motdepasse`
+- `/room`
 
-```bash
-python client.py 127.0.0.1 5000
-```
+Commandes crypto cote client :
 
-## Validation de l'étape 1
+- `/pubkey username` : affiche la cle publique locale connue pour ce contact.
+- `/dm username message` : envoie un message prive chiffre de bout en bout et signe.
 
-Les points suivants ont été vérifiés :
+Les messages de chat classiques restent limites a la room courante. Les messages `/dm` sont hors-room et passent par le relais serveur sous forme opaque.
 
-- compilation Python sans erreur avec `python -m py_compile server.py client.py` ;
-- démarrage du serveur avec port par défaut ;
-- démarrage du serveur avec port explicite ;
-- connexion de plusieurs clients simultanés ;
-- diffusion des messages aux autres clients connectés, sans echo chez l'émetteur ;
-- déconnexion d'un client sans arrêt du serveur ;
-- arrêt du serveur avec détection correcte côté client.
+## Fichiers generes
 
-## Cahier des charges global
+- `log_*.txt` : logs serveur par execution.
+- `users/<username_encode>/identity.priv` : cle privee RSA locale.
+- `users/<username_encode>/identity.pub` : cle publique RSA locale.
+- `users/<username_encode>/peers/*.pub` : cles publiques connues et pinnees localement.
 
-Le projet complet devra à terme respecter les points suivants :
+## Notes importantes
 
-- un serveur de chat capable de gérer plusieurs clients simultanément ;
-- un username choisi au démarrage et unique parmi les connexions actives ;
-- un système de rooms ;
-- certaines rooms protégées par mot de passe ;
-- une room par défaut nommée `general` ;
-- affichage uniquement des messages de la room courante ;
-- ajout d'un timestamp aux messages ;
-- attribution d'une couleur déterministe par utilisateur ;
-- logs serveur exportés dans un fichier horodaté ;
-- affichage distinctif des rooms protégées dans la console.
+- Le projet est pedagogique et n'est pas destine a la production.
+- Les messages prives 1-1 sont signes et verifies cote client.
+- Les cles publiques deja apprises sont conservees localement et ne sont pas remplacees silencieusement.
+- Les logs serveur des messages prives ne contiennent pas le plaintext.
 
-## Limites de la version actuelle
+## Validation
 
-Cette version est volontairement minimale pour respecter strictement le périmètre de l'étape 1. Elle ne contient aucune logique préparatoire pour les étapes suivantes.
+Des validations ont ete executees au fil des etapes, notamment :
+
+- compilation `python -m py_compile server.py client.py crypto_utils.py asymmetric_utils.py` ;
+- authentification, migration de hash et verification en temps constant ;
+- key exchange RSA de transport ;
+- annuaire de cles publiques et persistance locale ;
+- DM E2EE avec cle de session par paire ;
+- verification de signature et rejet d'un message altere.
