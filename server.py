@@ -5,17 +5,16 @@ from datetime import datetime
 import hashlib
 import json
 import base64
+import binascii
 import hmac
 import math
 import os
 from crypto_utils import (
-    build_transport_key_record,
     decrypt_transport_message,
     encrypt_transport_message,
-    parse_transport_key_record,
-    serialize_transport_key_record,
-    serialize_transport_key_metadata,
-    transport_key_bytes,
+)
+from asymmetric_utils import (
+    encrypt_with_public_key,
 )
 
 
@@ -41,7 +40,6 @@ LOG_FILENAME_FORMAT = "log_%Y-%m-%d_%H-%M-%S.txt"
 PROTECTED_ROOM_MARKER = "[PROTEGEE]"
 PASSWORD_STORE_FILE = "this_is_safe.txt"
 PASSWORD_RULES_FILE = "password_rules.json"
-USER_KEY_STORE_FILE = "user_keys_do_not_steal_plz.txt"
 DEFAULT_PASSWORD_RULES = {
     "min_length": 8,
     "require_uppercase": True,
@@ -60,13 +58,11 @@ rooms = {DEFAULT_ROOM: None}
 state_lock = threading.Lock()
 log_lock = threading.Lock()
 auth_lock = threading.Lock()
-key_lock = threading.Lock()
 log_file = None
 log_filename = None
 client_threads = []
 password_store = {}
 password_rules = {}
-user_key_store = {}
 
 
 def parse_port(argv):
@@ -142,6 +138,11 @@ def format_client_address(client_address):
 
 def send_line(client_socket, message):
     client_socket.sendall((message + "\n").encode("utf-8"))
+
+
+def send_secure_line(client_socket, session_key, message):
+    payload = encrypt_transport_message(message, session_key)
+    send_line(client_socket, f"ENCMSG {payload}")
 
 
 def get_username_color(username):
@@ -233,45 +234,6 @@ def save_password_store():
             )
 
     os.replace(temp_path, PASSWORD_STORE_FILE)
-
-
-def ensure_user_key_store_file():
-    if os.path.exists(USER_KEY_STORE_FILE):
-        return
-
-    with open(USER_KEY_STORE_FILE, "w", encoding="utf-8"):
-        pass
-
-
-def load_user_key_store():
-    ensure_user_key_store_file()
-    loaded_store = {}
-
-    with open(USER_KEY_STORE_FILE, "r", encoding="utf-8") as store_file:
-        for line in store_file:
-            line = line.strip()
-            if not line:
-                continue
-
-            parts = line.rsplit(":", 4)
-            if len(parts) != 5:
-                continue
-
-            username = parts[0]
-            loaded_store[username] = parse_transport_key_record(":".join(parts[1:]))
-
-    return loaded_store
-
-
-def save_user_key_store():
-    temp_path = f"{USER_KEY_STORE_FILE}.tmp"
-
-    with open(temp_path, "w", encoding="utf-8") as store_file:
-        for username in sorted(user_key_store):
-            serialized_record = serialize_transport_key_record(user_key_store[username])
-            store_file.write(f"{username}:{serialized_record}\n")
-
-    os.replace(temp_path, USER_KEY_STORE_FILE)
 
 
 def hash_password_md5_base64(password):
@@ -389,14 +351,6 @@ def get_auth_mode(username):
         return "REGISTER"
 
 
-def get_user_transport_key_record(username):
-    with key_lock:
-        key_record = user_key_store.get(username)
-        if key_record is None:
-            return None
-        return key_record.copy()
-
-
 def build_chat_message(username, message, color_code):
     timestamp = datetime.now().strftime("%H:%M:%S")
     colored_username = f"{color_code}{username}{ANSI_RESET}"
@@ -469,24 +423,21 @@ def broadcast_to_room(message, room_name, excluded_socket=None):
 def broadcast_encrypted_message_to_room(message, room_name, excluded_socket=None):
     with state_lock:
         recipients = [
-            (sock, info["username"])
+            (sock, info["session_key"])
             for sock, info in clients.items()
             if info["username"] is not None
             and info["authenticated"]
             and info["room"] == room_name
+            and info["session_key"] is not None
             and sock is not excluded_socket
         ]
 
     failed_clients = []
-    for recipient_socket, recipient_username in recipients:
+    for recipient_socket, recipient_session_key in recipients:
         try:
-            key_record = get_user_transport_key_record(recipient_username)
-            if key_record is None:
-                continue
-
             payload = encrypt_transport_message(
                 message,
-                transport_key_bytes(key_record),
+                recipient_session_key,
             )
             send_line(recipient_socket, f"ENCMSG {payload}")
         except (OSError, ValueError):
@@ -505,6 +456,18 @@ def receive_line(client_socket, buffer):
 
     raw_line, buffer = buffer.split(b"\n", 1)
     return raw_line.rstrip(b"\r"), buffer
+
+
+def receive_secure_line(client_socket, buffer, session_key):
+    raw_line, buffer = receive_line(client_socket, buffer)
+    if raw_line is None:
+        return None, buffer
+
+    message = raw_line.decode("utf-8", errors="replace")
+    if not message.startswith("ENCMSG "):
+        raise ValueError("Message non chiffre.")
+
+    return decrypt_transport_message(message[len("ENCMSG "):], session_key), buffer
 
 
 def try_register_username(client_socket, username):
@@ -569,13 +532,18 @@ def negotiate_username(client_socket):
         return username, buffer
 
 
-def authenticate_known_user(client_socket, buffer):
+def authenticate_known_user(client_socket, buffer, session_key):
     while True:
-        raw_password, buffer = receive_line(client_socket, buffer)
-        if raw_password is None:
-            return False, buffer
+        try:
+            password, buffer = receive_secure_line(client_socket, buffer, session_key)
+        except (ValueError, binascii.Error, UnicodeDecodeError):
+            send_secure_line(client_socket, session_key, "[server] Message chiffre invalide.")
+            continue
 
-        password = raw_password.decode("utf-8", errors="replace").strip()
+        if password is None:
+            return False, None, buffer
+
+        password = password.strip()
         client_info = get_client_snapshot(client_socket)
         client_address = None if client_info is None else client_info["address"]
         username = None if client_info is None else client_info["username"]
@@ -584,8 +552,8 @@ def authenticate_known_user(client_socket, buffer):
             stored_record = password_store.get(username)
 
         if stored_record is None:
-            send_line(client_socket, "AUTH_RETRY Compte introuvable.")
-            return False, buffer
+            send_secure_line(client_socket, session_key, "AUTH_RETRY Compte introuvable.")
+            return False, None, buffer
 
         if not verify_password_constant_time(password, stored_record):
             write_log(
@@ -593,14 +561,18 @@ def authenticate_known_user(client_socket, buffer):
                 client=client_address,
                 username=username,
             )
-            send_line(client_socket, "AUTH_RETRY Mot de passe incorrect.")
+            send_secure_line(client_socket, session_key, "AUTH_RETRY Mot de passe incorrect.")
             continue
 
         if stored_record["format"] == "legacy_md5":
             with auth_lock:
                 password_store[username] = build_scrypt_password_record(password)
                 save_password_store()
-            send_line(client_socket, "AUTH_INFO Mot de passe migre vers un hash moderne.")
+            send_secure_line(
+                client_socket,
+                session_key,
+                "AUTH_INFO Mot de passe migre vers un hash moderne.",
+            )
             write_log(
                 "PASSWORD_MIGRATED",
                 client=client_address,
@@ -613,7 +585,7 @@ def authenticate_known_user(client_socket, buffer):
         if authenticated_info is None:
             return False, None, buffer
 
-        send_line(client_socket, "AUTH_ACCEPTED")
+        send_secure_line(client_socket, session_key, "AUTH_ACCEPTED")
         write_log(
             "AUTH_ACCEPTED",
             client=authenticated_info["address"],
@@ -623,18 +595,23 @@ def authenticate_known_user(client_socket, buffer):
         return True, password, buffer
 
 
-def register_new_user(client_socket, buffer):
+def register_new_user(client_socket, buffer, session_key):
     while True:
-        raw_password, buffer = receive_line(client_socket, buffer)
-        if raw_password is None:
-            return False, buffer
+        try:
+            password, buffer = receive_secure_line(client_socket, buffer, session_key)
+            if password is None:
+                return False, None, buffer
 
-        raw_confirmation, buffer = receive_line(client_socket, buffer)
-        if raw_confirmation is None:
-            return False, buffer
+            confirmation, buffer = receive_secure_line(client_socket, buffer, session_key)
+        except (ValueError, binascii.Error, UnicodeDecodeError):
+            send_secure_line(client_socket, session_key, "[server] Message chiffre invalide.")
+            continue
 
-        password = raw_password.decode("utf-8", errors="replace").strip()
-        confirmation = raw_confirmation.decode("utf-8", errors="replace").strip()
+        if confirmation is None:
+            return False, None, buffer
+
+        password = password.strip()
+        confirmation = confirmation.strip()
         client_info = get_client_snapshot(client_socket)
         client_address = None if client_info is None else client_info["address"]
         username = None if client_info is None else client_info["username"]
@@ -645,7 +622,11 @@ def register_new_user(client_socket, buffer):
                 client=client_address,
                 username=username,
             )
-            send_line(client_socket, "AUTH_RETRY Les mots de passe ne correspondent pas.")
+            send_secure_line(
+                client_socket,
+                session_key,
+                "AUTH_RETRY Les mots de passe ne correspondent pas.",
+            )
             continue
 
         rule_errors = validate_password_rules(password)
@@ -655,7 +636,7 @@ def register_new_user(client_socket, buffer):
                 client=client_address,
                 username=username,
             )
-            send_line(client_socket, f"AUTH_RETRY {' '.join(rule_errors)}")
+            send_secure_line(client_socket, session_key, f"AUTH_RETRY {' '.join(rule_errors)}")
             continue
 
         stored_record = build_scrypt_password_record(password)
@@ -668,8 +649,12 @@ def register_new_user(client_socket, buffer):
             return False, None, buffer
 
         password_strength = describe_password_strength(password)
-        send_line(client_socket, f"AUTH_INFO Force du mot de passe: {password_strength}.")
-        send_line(client_socket, "AUTH_ACCEPTED")
+        send_secure_line(
+            client_socket,
+            session_key,
+            f"AUTH_INFO Force du mot de passe: {password_strength}.",
+        )
+        send_secure_line(client_socket, session_key, "AUTH_ACCEPTED")
         write_log(
             "ACCOUNT_CREATED",
             client=authenticated_info["address"],
@@ -686,43 +671,122 @@ def register_new_user(client_socket, buffer):
         return True, password, buffer
 
 
-def authenticate_client(client_socket, buffer):
+def authenticate_client(client_socket, buffer, session_key):
     client_info = get_client_snapshot(client_socket)
     if client_info is None:
         return False, None, buffer
 
     auth_mode = get_auth_mode(client_info["username"])
-    send_line(client_socket, f"AUTH_MODE {auth_mode}")
+    send_secure_line(client_socket, session_key, f"AUTH_MODE {auth_mode}")
 
     if auth_mode == "LOGIN":
-        return authenticate_known_user(client_socket, buffer)
+        return authenticate_known_user(client_socket, buffer, session_key)
 
-    return register_new_user(client_socket, buffer)
+    return register_new_user(client_socket, buffer, session_key)
 
 
-def ensure_transport_key(client_socket, auth_password, buffer):
+def prepare_key_exchange(client_socket):
     client_info = get_client_snapshot(client_socket)
     if client_info is None:
-        return False, None, buffer
+        return None, None, None
 
-    username = client_info["username"]
-    key_record = get_user_transport_key_record(username)
-    if key_record is None:
-        key_record = build_transport_key_record(auth_password)
-        with key_lock:
-            user_key_store[username] = key_record
-            save_user_key_store()
+    auth_mode = get_auth_mode(client_info["username"])
+    if auth_mode == "REGISTER":
+        send_line(client_socket, "KEYX_MODE REGISTER")
+        return auth_mode, None, None
 
-        write_log(
-            "TRANSPORT_KEY_CREATED",
-            client=client_info["address"],
-            username=username,
-            algorithm=key_record["algorithm"],
-            cost=key_record["cost"],
+    with auth_lock:
+        stored_record = password_store.get(client_info["username"])
+
+    if stored_record is None:
+        return None, None, None
+
+    nonce = os.urandom(16)
+    nonce_b64 = base64.b64encode(nonce).decode("ascii")
+    if stored_record["format"] == "legacy_md5":
+        send_line(client_socket, f"KEYX_MODE LOGIN legacy_md5 {nonce_b64}")
+    else:
+        send_line(
+            client_socket,
+            "KEYX_MODE LOGIN "
+            f"{stored_record['algorithm']} {stored_record['cost']} {stored_record['salt']} {nonce_b64}",
         )
 
-    send_line(client_socket, f"KEY_INFO {serialize_transport_key_metadata(key_record)}")
-    return True, key_record, buffer
+    return auth_mode, stored_record, nonce
+
+
+def key_exchange_verifier(stored_record):
+    if stored_record["format"] == "legacy_md5":
+        return base64.b64decode(stored_record["hash"].encode("ascii"))
+
+    if stored_record["algorithm"] != PASSWORD_HASH_ALGORITHM:
+        raise ValueError("Unsupported password algorithm.")
+
+    return base64.b64decode(stored_record["digest"].encode("ascii"))
+
+
+def establish_session_key(client_socket, buffer, stored_record=None, nonce=None):
+    client_info = get_client_snapshot(client_socket)
+    if client_info is None:
+        return "failed", None, buffer
+
+    raw_public_key, buffer = receive_line(client_socket, buffer)
+    if raw_public_key is None:
+        return "failed", None, buffer
+
+    message = raw_public_key.decode("utf-8", errors="replace")
+    if not message.startswith("KEYX_PUB "):
+        send_line(client_socket, "[server] Cle publique attendue.")
+        return "failed", None, buffer
+
+    try:
+        payload = message[len("KEYX_PUB "):]
+        if stored_record is not None:
+            public_key_b64, proof_b64 = payload.split(" ", 1)
+            received_proof = base64.b64decode(proof_b64.encode("ascii"), validate=True)
+        else:
+            public_key_b64 = payload
+            received_proof = None
+
+        public_key_pem = base64.b64decode(public_key_b64.encode("ascii"), validate=True)
+        if stored_record is not None:
+            expected_proof = hmac.digest(
+                key_exchange_verifier(stored_record),
+                public_key_pem + nonce,
+                hashlib.sha256,
+            )
+            if not hmac.compare_digest(received_proof, expected_proof):
+                write_log(
+                    "AUTH_REJECTED",
+                    client=client_info["address"],
+                    username=client_info["username"],
+                )
+                send_line(client_socket, "KEYX_REJECTED Mot de passe incorrect.")
+                return "retry", None, buffer
+
+        session_key = os.urandom(16)
+        encrypted_session_key = encrypt_with_public_key(public_key_pem, session_key)
+    except (ValueError, binascii.Error, UnicodeEncodeError):
+        send_line(client_socket, "[server] Cle publique invalide.")
+        return "failed", None, buffer
+
+    with state_lock:
+        if client_socket not in clients:
+            return "failed", None, buffer
+
+        clients[client_socket]["session_key"] = session_key
+        clients[client_socket]["public_key"] = public_key_pem.decode("utf-8")
+
+    send_line(
+        client_socket,
+        f"SESSION_KEY {base64.b64encode(encrypted_session_key).decode('ascii')}",
+    )
+    write_log(
+        "SESSION_KEY_ESTABLISHED",
+        client=client_info["address"],
+        username=client_info["username"],
+    )
+    return "ok", session_key, buffer
 
 
 def get_current_room(client_socket):
@@ -843,46 +907,55 @@ def handle_client(client_socket, client_address):
     write_log("CLIENT_CONNECTED", client=format_client_address(client_address))
     username = None
     buffer = b""
-    auth_password = None
-    transport_key_record = None
+    session_key = None
 
     try:
         username, buffer = negotiate_username(client_socket)
         if username is None:
             return
 
-        authenticated, auth_password, buffer = authenticate_client(client_socket, buffer)
+        while True:
+            key_exchange_mode, stored_record, key_exchange_nonce = prepare_key_exchange(client_socket)
+            if key_exchange_mode is None:
+                return
+
+            key_status, session_key, buffer = establish_session_key(
+                client_socket,
+                buffer,
+                stored_record,
+                key_exchange_nonce,
+            )
+            if key_status == "retry":
+                continue
+            if key_status != "ok":
+                return
+            break
+
+        authenticated, _, buffer = authenticate_client(client_socket, buffer, session_key)
         if not authenticated:
             return
 
-        key_ready, transport_key_record, buffer = ensure_transport_key(
-            client_socket,
-            auth_password,
-            buffer,
-        )
-        if not key_ready:
-            return
-
-        send_line(client_socket, f"[server] Vous avez rejoint la room {DEFAULT_ROOM}.")
+        send_secure_line(client_socket, session_key, f"[server] Vous avez rejoint la room {DEFAULT_ROOM}.")
 
         print(f"Username accepte: {username} ({client_address[0]}:{client_address[1]})")
 
         while True:
-            raw_message, buffer = receive_line(client_socket, buffer)
-            if raw_message is None:
+            try:
+                message, buffer = receive_secure_line(client_socket, buffer, session_key)
+            except (ValueError, binascii.Error, UnicodeDecodeError):
+                send_secure_line(client_socket, session_key, "[server] Message chiffre invalide.")
+                continue
+
+            if message is None:
                 break
 
-            message = raw_message.decode("utf-8", errors="replace").strip()
+            message = message.strip()
             if not message:
                 continue
 
             if message.startswith("/"):
                 response = process_command(client_socket, message)
-                send_line(client_socket, response)
-                continue
-
-            if not message.startswith("ENCMSG "):
-                send_line(client_socket, "[server] Les messages doivent etre chiffres.")
+                send_secure_line(client_socket, session_key, response)
                 continue
 
             room_name = get_current_room(client_socket)
@@ -893,18 +966,9 @@ def handle_client(client_socket, client_address):
             if client_info is None:
                 break
 
-            try:
-                plaintext_message = decrypt_transport_message(
-                    message[len("ENCMSG "):],
-                    transport_key_bytes(transport_key_record),
-                )
-            except ValueError:
-                send_line(client_socket, "[server] Message chiffre invalide.")
-                continue
-
             formatted_message = build_chat_message(
                 username,
-                plaintext_message,
+                message,
                 client_info["color"],
             )
             broadcast_encrypted_message_to_room(
@@ -938,13 +1002,11 @@ def handle_client(client_socket, client_address):
 def run_server(port):
     global password_rules
     global password_store
-    global user_key_store
 
     server_socket = None
     server_started = False
     password_rules = load_password_rules()
     password_store = load_password_store()
-    user_key_store = load_user_key_store()
     initialize_log_file()
     try:
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -965,6 +1027,8 @@ def run_server(port):
                         "room": None,
                         "color": None,
                         "authenticated": False,
+                        "session_key": None,
+                        "public_key": None,
                         "address": format_client_address(client_address),
                     }
 

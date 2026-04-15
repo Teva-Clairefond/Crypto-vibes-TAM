@@ -1,4 +1,5 @@
 import base64
+import binascii
 import hashlib
 import os
 import struct
@@ -161,8 +162,11 @@ def encrypt_transport_message(message, key):
 
 def decrypt_transport_message(payload, key):
     iv_b64, ciphertext_b64 = payload.split(":", 1)
-    iv = base64.b64decode(iv_b64.encode("ascii"))
-    ciphertext = base64.b64decode(ciphertext_b64.encode("ascii"))
+    try:
+        iv = base64.b64decode(iv_b64.encode("ascii"), validate=True)
+        ciphertext = base64.b64decode(ciphertext_b64.encode("ascii"), validate=True)
+    except (binascii.Error, UnicodeEncodeError) as exc:
+        raise ValueError("Invalid encrypted message encoding.") from exc
 
     if len(iv) != TEA_BLOCK_SIZE or len(ciphertext) % TEA_BLOCK_SIZE != 0:
         raise ValueError("Invalid encrypted message format.")
