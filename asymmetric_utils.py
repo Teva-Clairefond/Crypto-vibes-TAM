@@ -61,3 +61,28 @@ def decrypt_with_private_key(private_key_pem, ciphertext):
             label=None,
         ),
     )
+
+
+def sign_message(private_key_pem, message):
+    private_key = load_private_key(private_key_pem)
+    return private_key.sign(
+        message,
+        padding.PSS(
+            mgf=padding.MGF1(hashes.SHA256()),
+            salt_length=padding.PSS.MAX_LENGTH,
+        ),
+        hashes.SHA256(),
+    )
+
+
+def verify_signature(public_key_pem, message, signature):
+    public_key = load_public_key(public_key_pem)
+    public_key.verify(
+        signature,
+        message,
+        padding.PSS(
+            mgf=padding.MGF1(hashes.SHA256()),
+            salt_length=padding.PSS.MAX_LENGTH,
+        ),
+        hashes.SHA256(),
+    )

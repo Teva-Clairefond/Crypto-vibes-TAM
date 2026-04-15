@@ -956,7 +956,7 @@ def find_authenticated_client_by_username(username):
     return None, None
 
 
-def relay_private_key_message(sender_socket, encoded_target_username, encrypted_key_b64):
+def relay_private_key_message(sender_socket, encoded_target_username, encrypted_key_b64, signature_b64):
     sender_info = get_client_snapshot(sender_socket)
     if sender_info is None or sender_info["username"] is None:
         return "[server] Session invalide."
@@ -974,7 +974,7 @@ def relay_private_key_message(sender_socket, encoded_target_username, encrypted_
         send_secure_line(
             recipient_socket,
             recipient_info["session_key"],
-            f"E2EE_KEY_FROM {encode_username_component(sender_info['username'])} {encrypted_key_b64}",
+            f"E2EE_KEY_FROM {encode_username_component(sender_info['username'])} {encrypted_key_b64} {signature_b64}",
         )
     except OSError:
         remove_client(recipient_socket)
@@ -989,7 +989,7 @@ def relay_private_key_message(sender_socket, encoded_target_username, encrypted_
     return None
 
 
-def relay_private_message(sender_socket, encoded_target_username, encrypted_payload):
+def relay_private_message(sender_socket, encoded_target_username, encrypted_payload, signature_b64):
     sender_info = get_client_snapshot(sender_socket)
     if sender_info is None or sender_info["username"] is None:
         return "[server] Session invalide."
@@ -1007,7 +1007,7 @@ def relay_private_message(sender_socket, encoded_target_username, encrypted_payl
         send_secure_line(
             recipient_socket,
             recipient_info["session_key"],
-            f"E2EE_MSG_FROM {encode_username_component(sender_info['username'])} {encrypted_payload}",
+            f"E2EE_MSG_FROM {encode_username_component(sender_info['username'])} {encrypted_payload} {signature_b64}",
         )
     except OSError:
         remove_client(recipient_socket)
@@ -1121,8 +1121,8 @@ def handle_client(client_socket, client_address):
                 continue
 
             if message.startswith("E2EE_KEY "):
-                parts = message.split(" ", 2)
-                if len(parts) != 3:
+                parts = message.split(" ", 3)
+                if len(parts) != 4:
                     send_secure_line(
                         client_socket,
                         session_key,
@@ -1134,14 +1134,15 @@ def handle_client(client_socket, client_address):
                     client_socket,
                     parts[1],
                     parts[2],
+                    parts[3],
                 )
                 if response is not None:
                     send_secure_line(client_socket, session_key, response)
                 continue
 
             if message.startswith("E2EE_MSG "):
-                parts = message.split(" ", 2)
-                if len(parts) != 3:
+                parts = message.split(" ", 3)
+                if len(parts) != 4:
                     send_secure_line(
                         client_socket,
                         session_key,
@@ -1153,6 +1154,7 @@ def handle_client(client_socket, client_address):
                     client_socket,
                     parts[1],
                     parts[2],
+                    parts[3],
                 )
                 if response is not None:
                     send_secure_line(client_socket, session_key, response)

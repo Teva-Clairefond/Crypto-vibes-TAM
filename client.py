@@ -18,6 +18,8 @@ from asymmetric_utils import (
     load_private_key,
     private_key_to_pem,
     public_key_to_pem,
+    sign_message,
+    verify_signature,
 )
 
 
@@ -159,7 +161,11 @@ def load_known_public_keys(username):
 
 def upsert_known_public_key(owner_username, known_public_keys, peer_username, public_key_pem):
     if peer_username == owner_username:
-        return
+        return True
+
+    existing_public_key = known_public_keys.get(peer_username)
+    if existing_public_key is not None:
+        return existing_public_key == public_key_pem
 
     peer_directory = get_peer_keys_directory(owner_username)
     os.makedirs(peer_directory, exist_ok=True)
@@ -170,6 +176,7 @@ def upsert_known_public_key(owner_username, known_public_keys, peer_username, pu
         public_key_file.write(public_key_pem)
 
     known_public_keys[peer_username] = public_key_pem
+    return True
 
 
 def decode_pubdir_payload(payload):
@@ -198,8 +205,8 @@ def handle_protocol_message(
         previous_active_keys = dict(active_public_keys)
         active_public_keys.clear()
         for peer_username, public_key_pem in pending_directory.items():
-            active_public_keys[peer_username] = public_key_pem
-            upsert_known_public_key(username, known_public_keys, peer_username, public_key_pem)
+            if upsert_known_public_key(username, known_public_keys, peer_username, public_key_pem):
+                active_public_keys[peer_username] = known_public_keys[peer_username]
 
         for peer_username in set(previous_active_keys) | set(active_public_keys):
             if previous_active_keys.get(peer_username) != active_public_keys.get(peer_username):
@@ -215,10 +222,13 @@ def handle_protocol_message(
 
     if message.startswith("PUBDIR_ADD "):
         peer_username, public_key_pem = decode_pubdir_payload(message[len("PUBDIR_ADD "):])
-        if active_public_keys.get(peer_username) != public_key_pem:
+        if upsert_known_public_key(username, known_public_keys, peer_username, public_key_pem):
+            if active_public_keys.get(peer_username) != known_public_keys[peer_username]:
+                pair_session_keys.pop(peer_username, None)
+            active_public_keys[peer_username] = known_public_keys[peer_username]
+        else:
+            active_public_keys.pop(peer_username, None)
             pair_session_keys.pop(peer_username, None)
-        active_public_keys[peer_username] = public_key_pem
-        upsert_known_public_key(username, known_public_keys, peer_username, public_key_pem)
         return True
 
     if message.startswith("PUBDIR_REMOVE "):
@@ -232,19 +242,59 @@ def handle_protocol_message(
 
 def handle_private_protocol_message(
     message,
+    username,
     private_key_pem,
+    known_public_keys,
     pair_session_keys,
 ):
     if message.startswith("E2EE_KEY_FROM "):
-        encoded_username, encrypted_key_b64 = message[len("E2EE_KEY_FROM "):].split(" ", 1)
+        encoded_username, encrypted_key_b64, signature_b64 = message[len("E2EE_KEY_FROM "):].split(" ", 2)
         peer_username = decode_username_component(encoded_username)
+        sender_public_key = known_public_keys.get(peer_username)
+        if sender_public_key is None:
+            return True, f"[client] Cle publique inconnue pour {peer_username}."
+
+        signed_payload = build_private_signature_payload(
+            "E2EE_KEY",
+            peer_username,
+            username,
+            encrypted_key_b64,
+        )
+        try:
+            verify_signature(
+                sender_public_key.encode("utf-8"),
+                signed_payload,
+                base64.b64decode(signature_b64.encode("ascii"), validate=True),
+            )
+        except Exception:
+            return True, f"[client] Signature invalide pour la cle privee de {peer_username}."
+
         encrypted_key = base64.b64decode(encrypted_key_b64.encode("ascii"), validate=True)
         pair_session_keys[peer_username] = decrypt_with_private_key(private_key_pem, encrypted_key)
         return True, None
 
     if message.startswith("E2EE_MSG_FROM "):
-        encoded_username, encrypted_payload = message[len("E2EE_MSG_FROM "):].split(" ", 1)
+        encoded_username, encrypted_payload, signature_b64 = message[len("E2EE_MSG_FROM "):].split(" ", 2)
         peer_username = decode_username_component(encoded_username)
+        sender_public_key = known_public_keys.get(peer_username)
+        if sender_public_key is None:
+            return True, f"[client] Cle publique inconnue pour {peer_username}."
+
+        signed_payload = build_private_signature_payload(
+            "E2EE_MSG",
+            peer_username,
+            username,
+            encrypted_payload,
+        )
+        try:
+            verify_signature(
+                sender_public_key.encode("utf-8"),
+                signed_payload,
+                base64.b64decode(signature_b64.encode("ascii"), validate=True),
+            )
+        except Exception:
+            return True, f"[client] Signature invalide pour un message prive de {peer_username}."
+
         pair_session_key = pair_session_keys.get(peer_username)
         if pair_session_key is None:
             return True, f"[client] Cle de session privee absente pour {peer_username}."
@@ -257,6 +307,12 @@ def handle_private_protocol_message(
         return True, f"[private] {peer_username}: {plaintext}"
 
     return False, None
+
+
+def build_private_signature_payload(message_type, sender_username, recipient_username, encrypted_payload):
+    return (
+        f"{message_type}\n{sender_username}\n{recipient_username}\n{encrypted_payload}"
+    ).encode("utf-8")
 
 
 def receive_messages(
@@ -311,7 +367,9 @@ def receive_messages(
                 with pair_keys_lock:
                     handled, rendered_message = handle_private_protocol_message(
                         message,
+                        username,
                         private_key_pem,
+                        known_public_keys,
                         pair_session_keys,
                     )
                 if handled:
@@ -690,10 +748,10 @@ def run_client(host, port):
                 private_message = parts[2].strip()
 
                 with known_keys_lock:
-                    peer_public_key = known_public_keys.get(peer_username)
+                    peer_public_key = active_public_keys.get(peer_username)
 
                 if peer_public_key is None:
-                    print(f"[client] Cle publique inconnue pour {peer_username}.")
+                    print(f"[client] Cle publique active indisponible pour {peer_username}.")
                     continue
 
                 with pair_keys_lock:
@@ -718,16 +776,38 @@ def run_client(host, port):
 
                 try:
                     if encrypted_pair_key is not None:
+                        key_signature = base64.b64encode(
+                            sign_message(
+                                private_key_pem,
+                                build_private_signature_payload(
+                                    "E2EE_KEY",
+                                    username,
+                                    peer_username,
+                                    encrypted_pair_key,
+                                ),
+                            )
+                        ).decode("ascii")
                         send_secure_line(
                             sock,
                             transport_key,
-                            f"E2EE_KEY {encoded_peer_username} {encrypted_pair_key}",
+                            f"E2EE_KEY {encoded_peer_username} {encrypted_pair_key} {key_signature}",
                         )
 
+                    message_signature = base64.b64encode(
+                        sign_message(
+                            private_key_pem,
+                            build_private_signature_payload(
+                                "E2EE_MSG",
+                                username,
+                                peer_username,
+                                encrypted_private_message,
+                            ),
+                        )
+                    ).decode("ascii")
                     send_secure_line(
                         sock,
                         transport_key,
-                        f"E2EE_MSG {encoded_peer_username} {encrypted_private_message}",
+                        f"E2EE_MSG {encoded_peer_username} {encrypted_private_message} {message_signature}",
                     )
                 except OSError:
                     print("Impossible d'envoyer le message: connexion fermee.")
