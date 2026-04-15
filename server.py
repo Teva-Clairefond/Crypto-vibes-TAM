@@ -151,6 +151,14 @@ def encode_pubdir_entry(username, public_key_pem):
     return f"{encoded_username} {encoded_public_key}"
 
 
+def encode_username_component(username):
+    return base64.b64encode(username.encode("utf-8")).decode("ascii")
+
+
+def decode_username_component(encoded_username):
+    return base64.b64decode(encoded_username.encode("ascii"), validate=True).decode("utf-8")
+
+
 def get_username_color(username):
     digest = hashlib.sha256(username.encode("utf-8")).digest()
     return ANSI_COLORS[digest[0] % len(ANSI_COLORS)]
@@ -939,6 +947,81 @@ def join_room(client_socket, room_name, password):
     return True, f"[server] Vous avez rejoint la room {format_room_display(room_name)}."
 
 
+def find_authenticated_client_by_username(username):
+    with state_lock:
+        for sock, info in clients.items():
+            if info["authenticated"] and info["username"] == username:
+                return sock, info.copy()
+
+    return None, None
+
+
+def relay_private_key_message(sender_socket, encoded_target_username, encrypted_key_b64):
+    sender_info = get_client_snapshot(sender_socket)
+    if sender_info is None or sender_info["username"] is None:
+        return "[server] Session invalide."
+
+    try:
+        target_username = decode_username_component(encoded_target_username)
+    except (ValueError, binascii.Error, UnicodeDecodeError):
+        return "[server] Destinataire prive invalide."
+
+    recipient_socket, recipient_info = find_authenticated_client_by_username(target_username)
+    if recipient_socket is None or recipient_info is None or recipient_info["session_key"] is None:
+        return f"[server] Utilisateur prive indisponible: {target_username}."
+
+    try:
+        send_secure_line(
+            recipient_socket,
+            recipient_info["session_key"],
+            f"E2EE_KEY_FROM {encode_username_component(sender_info['username'])} {encrypted_key_b64}",
+        )
+    except OSError:
+        remove_client(recipient_socket)
+        return f"[server] Utilisateur prive indisponible: {target_username}."
+
+    write_log(
+        "E2EE_KEY_RELAY",
+        from_user=sender_info["username"],
+        to_user=target_username,
+        ciphertext=encrypted_key_b64,
+    )
+    return None
+
+
+def relay_private_message(sender_socket, encoded_target_username, encrypted_payload):
+    sender_info = get_client_snapshot(sender_socket)
+    if sender_info is None or sender_info["username"] is None:
+        return "[server] Session invalide."
+
+    try:
+        target_username = decode_username_component(encoded_target_username)
+    except (ValueError, binascii.Error, UnicodeDecodeError):
+        return "[server] Destinataire prive invalide."
+
+    recipient_socket, recipient_info = find_authenticated_client_by_username(target_username)
+    if recipient_socket is None or recipient_info is None or recipient_info["session_key"] is None:
+        return f"[server] Utilisateur prive indisponible: {target_username}."
+
+    try:
+        send_secure_line(
+            recipient_socket,
+            recipient_info["session_key"],
+            f"E2EE_MSG_FROM {encode_username_component(sender_info['username'])} {encrypted_payload}",
+        )
+    except OSError:
+        remove_client(recipient_socket)
+        return f"[server] Utilisateur prive indisponible: {target_username}."
+
+    write_log(
+        "E2EE_MESSAGE_RELAY",
+        from_user=sender_info["username"],
+        to_user=target_username,
+        ciphertext=encrypted_payload,
+    )
+    return None
+
+
 def process_command(client_socket, message):
     parts = message.split()
     command = parts[0]
@@ -1035,6 +1118,44 @@ def handle_client(client_socket, client_address):
 
             message = message.strip()
             if not message:
+                continue
+
+            if message.startswith("E2EE_KEY "):
+                parts = message.split(" ", 2)
+                if len(parts) != 3:
+                    send_secure_line(
+                        client_socket,
+                        session_key,
+                        "[server] Message prive invalide.",
+                    )
+                    continue
+
+                response = relay_private_key_message(
+                    client_socket,
+                    parts[1],
+                    parts[2],
+                )
+                if response is not None:
+                    send_secure_line(client_socket, session_key, response)
+                continue
+
+            if message.startswith("E2EE_MSG "):
+                parts = message.split(" ", 2)
+                if len(parts) != 3:
+                    send_secure_line(
+                        client_socket,
+                        session_key,
+                        "[server] Message prive invalide.",
+                    )
+                    continue
+
+                response = relay_private_message(
+                    client_socket,
+                    parts[1],
+                    parts[2],
+                )
+                if response is not None:
+                    send_secure_line(client_socket, session_key, response)
                 continue
 
             if message.startswith("/"):

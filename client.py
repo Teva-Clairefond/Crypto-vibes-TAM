@@ -13,6 +13,7 @@ from crypto_utils import (
 )
 from asymmetric_utils import (
     decrypt_with_private_key,
+    encrypt_with_public_key,
     generate_rsa_private_key,
     load_private_key,
     private_key_to_pem,
@@ -26,6 +27,7 @@ BUFFER_SIZE = 4096
 USER_STORAGE_DIR = "users"
 IDENTITY_KEY_BASENAME = "identity"
 PEERS_DIRNAME = "peers"
+PAIR_SESSION_KEY_BYTES = 16
 
 
 def parse_args(argv):
@@ -185,6 +187,7 @@ def handle_protocol_message(
     message,
     known_public_keys,
     active_public_keys,
+    pair_session_keys,
     pending_directory,
 ):
     if message == "PUBDIR_BEGIN":
@@ -192,10 +195,16 @@ def handle_protocol_message(
         return True
 
     if message == "PUBDIR_END":
+        previous_active_keys = dict(active_public_keys)
         active_public_keys.clear()
         for peer_username, public_key_pem in pending_directory.items():
             active_public_keys[peer_username] = public_key_pem
             upsert_known_public_key(username, known_public_keys, peer_username, public_key_pem)
+
+        for peer_username in set(previous_active_keys) | set(active_public_keys):
+            if previous_active_keys.get(peer_username) != active_public_keys.get(peer_username):
+                pair_session_keys.pop(peer_username, None)
+
         pending_directory.clear()
         return True
 
@@ -206,6 +215,8 @@ def handle_protocol_message(
 
     if message.startswith("PUBDIR_ADD "):
         peer_username, public_key_pem = decode_pubdir_payload(message[len("PUBDIR_ADD "):])
+        if active_public_keys.get(peer_username) != public_key_pem:
+            pair_session_keys.pop(peer_username, None)
         active_public_keys[peer_username] = public_key_pem
         upsert_known_public_key(username, known_public_keys, peer_username, public_key_pem)
         return True
@@ -213,9 +224,39 @@ def handle_protocol_message(
     if message.startswith("PUBDIR_REMOVE "):
         peer_username = decode_username_component(message[len("PUBDIR_REMOVE "):])
         active_public_keys.pop(peer_username, None)
+        pair_session_keys.pop(peer_username, None)
         return True
 
     return False
+
+
+def handle_private_protocol_message(
+    message,
+    private_key_pem,
+    pair_session_keys,
+):
+    if message.startswith("E2EE_KEY_FROM "):
+        encoded_username, encrypted_key_b64 = message[len("E2EE_KEY_FROM "):].split(" ", 1)
+        peer_username = decode_username_component(encoded_username)
+        encrypted_key = base64.b64decode(encrypted_key_b64.encode("ascii"), validate=True)
+        pair_session_keys[peer_username] = decrypt_with_private_key(private_key_pem, encrypted_key)
+        return True, None
+
+    if message.startswith("E2EE_MSG_FROM "):
+        encoded_username, encrypted_payload = message[len("E2EE_MSG_FROM "):].split(" ", 1)
+        peer_username = decode_username_component(encoded_username)
+        pair_session_key = pair_session_keys.get(peer_username)
+        if pair_session_key is None:
+            return True, f"[client] Cle de session privee absente pour {peer_username}."
+
+        try:
+            plaintext = decrypt_transport_message(encrypted_payload, pair_session_key)
+        except (ValueError, binascii.Error, UnicodeDecodeError):
+            return True, f"[client] Message prive illisible de {peer_username}."
+
+        return True, f"[private] {peer_username}: {plaintext}"
+
+    return False, None
 
 
 def receive_messages(
@@ -223,9 +264,12 @@ def receive_messages(
     stop_event,
     transport_key,
     username,
+    private_key_pem,
     known_public_keys,
     active_public_keys,
     known_keys_lock,
+    pair_session_keys,
+    pair_keys_lock,
     initial_buffer=b"",
 ):
     buffer = initial_buffer
@@ -250,17 +294,32 @@ def receive_messages(
                     message = "[client] Impossible de dechiffrer le message."
 
             try:
-                with known_keys_lock:
+                with known_keys_lock, pair_keys_lock:
                     if handle_protocol_message(
                         username,
                         message,
                         known_public_keys,
                         active_public_keys,
+                        pair_session_keys,
                         pending_directory,
                     ):
                         continue
             except (ValueError, binascii.Error, UnicodeDecodeError):
                 message = "[client] Annuaire de cles publiques invalide."
+
+            try:
+                with pair_keys_lock:
+                    handled, rendered_message = handle_private_protocol_message(
+                        message,
+                        private_key_pem,
+                        pair_session_keys,
+                    )
+                if handled:
+                    if rendered_message is not None:
+                        print(rendered_message, flush=True)
+                    continue
+            except (ValueError, binascii.Error, UnicodeDecodeError):
+                message = "[client] Message prive invalide."
 
             print(message, flush=True)
     except OSError:
@@ -562,12 +621,14 @@ def run_client(host, port):
 
     print(f"Username accepte: {username}")
     print("Authentification reussie.")
-    print("Commandes: /create nom_room [motdepasse], /join nom_room [motdepasse], /room, /pubkey username")
+    print("Commandes: /create nom_room [motdepasse], /join nom_room [motdepasse], /room, /pubkey username, /dm username message")
 
     stop_event = threading.Event()
     known_public_keys = load_known_public_keys(username)
     active_public_keys = {}
     known_keys_lock = threading.Lock()
+    pair_session_keys = {}
+    pair_keys_lock = threading.Lock()
 
     receiver = threading.Thread(
         target=receive_messages,
@@ -576,9 +637,12 @@ def run_client(host, port):
             stop_event,
             transport_key,
             username,
+            private_key_pem,
             known_public_keys,
             active_public_keys,
             known_keys_lock,
+            pair_session_keys,
+            pair_keys_lock,
             buffer,
         ),
         daemon=True,
@@ -614,6 +678,60 @@ def run_client(host, port):
                     print(f"[client] Cle publique inconnue pour {peer_username}.")
                 else:
                     print(public_key_pem, flush=True)
+                continue
+
+            if message.startswith("/dm "):
+                parts = message.split(" ", 2)
+                if len(parts) < 3 or not parts[1].strip() or not parts[2].strip():
+                    print("Usage: /dm username message")
+                    continue
+
+                peer_username = parts[1].strip()
+                private_message = parts[2].strip()
+
+                with known_keys_lock:
+                    peer_public_key = known_public_keys.get(peer_username)
+
+                if peer_public_key is None:
+                    print(f"[client] Cle publique inconnue pour {peer_username}.")
+                    continue
+
+                with pair_keys_lock:
+                    pair_session_key = pair_session_keys.get(peer_username)
+                    encrypted_pair_key = None
+                    if pair_session_key is None:
+                        pair_session_key = os.urandom(PAIR_SESSION_KEY_BYTES)
+                        encrypted_pair_key = base64.b64encode(
+                            encrypt_with_public_key(
+                                peer_public_key.encode("utf-8"),
+                                pair_session_key,
+                            )
+                        ).decode("ascii")
+                        pair_session_keys[peer_username] = pair_session_key
+
+                    encrypted_private_message = encrypt_transport_message(
+                        private_message,
+                        pair_session_key,
+                    )
+
+                encoded_peer_username = encode_username_component(peer_username)
+
+                try:
+                    if encrypted_pair_key is not None:
+                        send_secure_line(
+                            sock,
+                            transport_key,
+                            f"E2EE_KEY {encoded_peer_username} {encrypted_pair_key}",
+                        )
+
+                    send_secure_line(
+                        sock,
+                        transport_key,
+                        f"E2EE_MSG {encoded_peer_username} {encrypted_private_message}",
+                    )
+                except OSError:
+                    print("Impossible d'envoyer le message: connexion fermee.")
+                    stop_event.set()
                 continue
 
             try:
