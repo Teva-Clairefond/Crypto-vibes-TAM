@@ -145,6 +145,12 @@ def send_secure_line(client_socket, session_key, message):
     send_line(client_socket, f"ENCMSG {payload}")
 
 
+def encode_pubdir_entry(username, public_key_pem):
+    encoded_username = base64.b64encode(username.encode("utf-8")).decode("ascii")
+    encoded_public_key = base64.b64encode(public_key_pem.encode("utf-8")).decode("ascii")
+    return f"{encoded_username} {encoded_public_key}"
+
+
 def get_username_color(username):
     digest = hashlib.sha256(username.encode("utf-8")).digest()
     return ANSI_COLORS[digest[0] % len(ANSI_COLORS)]
@@ -381,6 +387,75 @@ def get_client_snapshot(client_socket):
             return None
 
         return client_info.copy()
+
+
+def authenticated_public_key_entries(excluded_username=None):
+    with state_lock:
+        entries = [
+            (info["username"], info["public_key"])
+            for info in clients.values()
+            if info["authenticated"]
+            and info["public_key"] is not None
+            and info["username"] is not None
+            and info["username"] != excluded_username
+        ]
+
+    return sorted(entries, key=lambda item: item[0])
+
+
+def send_public_key_directory(client_socket):
+    client_info = get_client_snapshot(client_socket)
+    if client_info is None or not client_info["authenticated"] or client_info["session_key"] is None:
+        return
+
+    entries = authenticated_public_key_entries(excluded_username=client_info["username"])
+    send_secure_line(client_socket, client_info["session_key"], "PUBDIR_BEGIN")
+    for username, public_key_pem in entries:
+        send_secure_line(
+            client_socket,
+            client_info["session_key"],
+            f"PUBDIR_ENTRY {encode_pubdir_entry(username, public_key_pem)}",
+        )
+    send_secure_line(client_socket, client_info["session_key"], "PUBDIR_END")
+
+
+def broadcast_public_key_add(username, public_key_pem, excluded_socket=None):
+    with state_lock:
+        recipients = [
+            (sock, info["session_key"])
+            for sock, info in clients.items()
+            if info["authenticated"]
+            and info["session_key"] is not None
+            and info["username"] is not None
+            and info["username"] != username
+            and sock is not excluded_socket
+        ]
+
+    payload = f"PUBDIR_ADD {encode_pubdir_entry(username, public_key_pem)}"
+    for recipient_socket, session_key in recipients:
+        try:
+            send_secure_line(recipient_socket, session_key, payload)
+        except OSError:
+            remove_client(recipient_socket)
+
+
+def broadcast_public_key_remove(username, excluded_socket=None):
+    with state_lock:
+        recipients = [
+            (sock, info["session_key"])
+            for sock, info in clients.items()
+            if info["authenticated"]
+            and info["session_key"] is not None
+            and info["username"] is not None
+            and sock is not excluded_socket
+        ]
+
+    encoded_username = base64.b64encode(username.encode("utf-8")).decode("ascii")
+    for recipient_socket, session_key in recipients:
+        try:
+            send_secure_line(recipient_socket, session_key, f"PUBDIR_REMOVE {encoded_username}")
+        except OSError:
+            remove_client(recipient_socket)
 
 
 def is_room_protected(room_name):
@@ -936,6 +1011,15 @@ def handle_client(client_socket, client_address):
             return
 
         send_secure_line(client_socket, session_key, f"[server] Vous avez rejoint la room {DEFAULT_ROOM}.")
+        send_public_key_directory(client_socket)
+
+        client_info = get_client_snapshot(client_socket)
+        if client_info is not None and client_info["public_key"] is not None:
+            broadcast_public_key_add(
+                client_info["username"],
+                client_info["public_key"],
+                excluded_socket=client_socket,
+            )
 
         print(f"Username accepte: {username} ({client_address[0]}:{client_address[1]})")
 
@@ -981,6 +1065,11 @@ def handle_client(client_socket, client_address):
     finally:
         released_info = remove_client(client_socket)
         if released_info is not None and released_info["username"] is not None:
+            if released_info["authenticated"] and released_info["public_key"] is not None:
+                broadcast_public_key_remove(
+                    released_info["username"],
+                    excluded_socket=client_socket,
+                )
             write_log(
                 "CLIENT_DISCONNECTED",
                 client=released_info["address"],

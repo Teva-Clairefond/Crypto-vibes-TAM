@@ -25,6 +25,7 @@ DEFAULT_PORT = 5000
 BUFFER_SIZE = 4096
 USER_STORAGE_DIR = "users"
 IDENTITY_KEY_BASENAME = "identity"
+PEERS_DIRNAME = "peers"
 
 
 def parse_args(argv):
@@ -109,8 +110,126 @@ def parse_scrypt_cost(cost):
     return values["n"], values["r"], values["p"]
 
 
-def receive_messages(sock, stop_event, transport_key, initial_buffer=b""):
+def read_console_line(prompt):
+    print(prompt, end="", flush=True)
+    try:
+        return sys.stdin.readline()
+    except OSError:
+        return ""
+
+
+def encode_username_component(username):
+    return base64.urlsafe_b64encode(username.encode("utf-8")).decode("ascii")
+
+
+def decode_username_component(encoded_username):
+    return base64.urlsafe_b64decode(encoded_username.encode("ascii")).decode("utf-8")
+
+
+def get_user_storage_directory(username):
+    return os.path.join(USER_STORAGE_DIR, encode_username_component(username))
+
+
+def get_peer_keys_directory(username):
+    return os.path.join(get_user_storage_directory(username), PEERS_DIRNAME)
+
+
+def load_known_public_keys(username):
+    peer_directory = get_peer_keys_directory(username)
+    known_public_keys = {}
+    if not os.path.isdir(peer_directory):
+        return known_public_keys
+
+    for entry in os.listdir(peer_directory):
+        if not entry.endswith(".pub"):
+            continue
+
+        encoded_username = entry[:-4]
+        try:
+            peer_username = decode_username_component(encoded_username)
+            with open(os.path.join(peer_directory, entry), "r", encoding="utf-8") as public_key_file:
+                known_public_keys[peer_username] = public_key_file.read()
+        except (OSError, ValueError, binascii.Error, UnicodeDecodeError):
+            continue
+
+    return known_public_keys
+
+
+def upsert_known_public_key(owner_username, known_public_keys, peer_username, public_key_pem):
+    if peer_username == owner_username:
+        return
+
+    peer_directory = get_peer_keys_directory(owner_username)
+    os.makedirs(peer_directory, exist_ok=True)
+    peer_filename = f"{encode_username_component(peer_username)}.pub"
+    peer_path = os.path.join(peer_directory, peer_filename)
+
+    with open(peer_path, "w", encoding="utf-8") as public_key_file:
+        public_key_file.write(public_key_pem)
+
+    known_public_keys[peer_username] = public_key_pem
+
+
+def decode_pubdir_payload(payload):
+    encoded_username, encoded_public_key = payload.split(" ", 1)
+    peer_username = decode_username_component(encoded_username)
+    public_key_pem = base64.b64decode(
+        encoded_public_key.encode("ascii"),
+        validate=True,
+    ).decode("utf-8")
+    return peer_username, public_key_pem
+
+
+def handle_protocol_message(
+    username,
+    message,
+    known_public_keys,
+    active_public_keys,
+    pending_directory,
+):
+    if message == "PUBDIR_BEGIN":
+        pending_directory.clear()
+        return True
+
+    if message == "PUBDIR_END":
+        active_public_keys.clear()
+        for peer_username, public_key_pem in pending_directory.items():
+            active_public_keys[peer_username] = public_key_pem
+            upsert_known_public_key(username, known_public_keys, peer_username, public_key_pem)
+        pending_directory.clear()
+        return True
+
+    if message.startswith("PUBDIR_ENTRY "):
+        peer_username, public_key_pem = decode_pubdir_payload(message[len("PUBDIR_ENTRY "):])
+        pending_directory[peer_username] = public_key_pem
+        return True
+
+    if message.startswith("PUBDIR_ADD "):
+        peer_username, public_key_pem = decode_pubdir_payload(message[len("PUBDIR_ADD "):])
+        active_public_keys[peer_username] = public_key_pem
+        upsert_known_public_key(username, known_public_keys, peer_username, public_key_pem)
+        return True
+
+    if message.startswith("PUBDIR_REMOVE "):
+        peer_username = decode_username_component(message[len("PUBDIR_REMOVE "):])
+        active_public_keys.pop(peer_username, None)
+        return True
+
+    return False
+
+
+def receive_messages(
+    sock,
+    stop_event,
+    transport_key,
+    username,
+    known_public_keys,
+    active_public_keys,
+    known_keys_lock,
+    initial_buffer=b"",
+):
     buffer = initial_buffer
+    pending_directory = {}
 
     try:
         while not stop_event.is_set():
@@ -129,24 +248,25 @@ def receive_messages(sock, stop_event, transport_key, initial_buffer=b""):
                     )
                 except (ValueError, binascii.Error, UnicodeDecodeError):
                     message = "[client] Impossible de dechiffrer le message."
+
+            try:
+                with known_keys_lock:
+                    if handle_protocol_message(
+                        username,
+                        message,
+                        known_public_keys,
+                        active_public_keys,
+                        pending_directory,
+                    ):
+                        continue
+            except (ValueError, binascii.Error, UnicodeDecodeError):
+                message = "[client] Annuaire de cles publiques invalide."
+
             print(message, flush=True)
     except OSError:
         if not stop_event.is_set():
             print("Connexion interrompue.")
             stop_event.set()
-
-
-def read_console_line(prompt):
-    print(prompt, end="", flush=True)
-    try:
-        return sys.stdin.readline()
-    except OSError:
-        return ""
-
-
-def get_user_storage_directory(username):
-    safe_username = base64.urlsafe_b64encode(username.encode("utf-8")).decode("ascii")
-    return os.path.join(USER_STORAGE_DIR, safe_username)
 
 
 def ensure_identity_key_pair(username):
@@ -442,13 +562,25 @@ def run_client(host, port):
 
     print(f"Username accepte: {username}")
     print("Authentification reussie.")
-    print("Commandes: /create nom_room [motdepasse], /join nom_room [motdepasse], /room")
+    print("Commandes: /create nom_room [motdepasse], /join nom_room [motdepasse], /room, /pubkey username")
 
     stop_event = threading.Event()
+    known_public_keys = load_known_public_keys(username)
+    active_public_keys = {}
+    known_keys_lock = threading.Lock()
 
     receiver = threading.Thread(
         target=receive_messages,
-        args=(sock, stop_event, transport_key, buffer),
+        args=(
+            sock,
+            stop_event,
+            transport_key,
+            username,
+            known_public_keys,
+            active_public_keys,
+            known_keys_lock,
+            buffer,
+        ),
         daemon=True,
     )
 
@@ -467,6 +599,21 @@ def run_client(host, port):
 
             message = line.rstrip("\r\n")
             if not message:
+                continue
+
+            if message == "/pubkey" or message.startswith("/pubkey "):
+                peer_username = message[len("/pubkey"):].strip()
+                if not peer_username:
+                    print("Usage: /pubkey username")
+                    continue
+
+                with known_keys_lock:
+                    public_key_pem = known_public_keys.get(peer_username)
+
+                if public_key_pem is None:
+                    print(f"[client] Cle publique inconnue pour {peer_username}.")
+                else:
+                    print(public_key_pem, flush=True)
                 continue
 
             try:
