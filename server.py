@@ -38,6 +38,8 @@ ANSI_COLORS = [
 ]
 LOG_FILENAME_FORMAT = "log_%Y-%m-%d_%H-%M-%S.txt"
 PROTECTED_ROOM_MARKER = "[PROTEGEE]"
+PROTECTED_ROOM_EMOJI = "🔒"
+OPEN_ROOM_EMOJI = "🔓"
 PASSWORD_STORE_FILE = "this_is_safe.txt"
 PASSWORD_RULES_FILE = "password_rules.json"
 DEFAULT_PASSWORD_RULES = {
@@ -369,6 +371,24 @@ def build_chat_message(username, message, color_code):
     timestamp = datetime.now().strftime("%H:%M:%S")
     colored_username = f"{color_code}{username}{ANSI_RESET}"
     return f"[{timestamp}] {colored_username}: {message}"
+
+
+def room_type_emoji(room_name):
+    if is_room_protected(room_name):
+        return PROTECTED_ROOM_EMOJI
+
+    return OPEN_ROOM_EMOJI
+
+
+def build_room_chat_message(username, room_name, message, color_code):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    colored_username = f"{color_code}{username}{ANSI_RESET}"
+    return (
+        f"[{timestamp}] "
+        f"{{{room_name}}} "
+        f"{{{room_type_emoji(room_name)}}} "
+        f"{colored_username}: {message}"
+    )
 
 
 def remove_client(client_socket):
@@ -1173,8 +1193,9 @@ def handle_client(client_socket, client_address):
             if client_info is None:
                 break
 
-            formatted_message = build_chat_message(
+            formatted_message = build_room_chat_message(
                 username,
+                room_name,
                 message,
                 client_info["color"],
             )

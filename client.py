@@ -1,10 +1,12 @@
 import ctypes
+import hashlib
+import re
 import socket
 import sys
 import threading
+import time
 import base64
 import binascii
-import hashlib
 import hmac
 import os
 from crypto_utils import (
@@ -30,6 +32,25 @@ USER_STORAGE_DIR = "users"
 IDENTITY_KEY_BASENAME = "identity"
 PEERS_DIRNAME = "peers"
 PAIR_SESSION_KEY_BYTES = 16
+ANSI_RESET = "\033[0m"
+ANSI_COLORS = [
+    "\033[31m",
+    "\033[32m",
+    "\033[33m",
+    "\033[34m",
+    "\033[35m",
+    "\033[36m",
+    "\033[91m",
+    "\033[92m",
+    "\033[94m",
+    "\033[95m",
+    "\033[96m",
+]
+PROTECTED_ROOM_MARKER = "[PROTEGEE]"
+PROTECTED_ROOM_EMOJI = "🔒"
+OPEN_ROOM_EMOJI = "🔓"
+ROOM_RESPONSE_PATTERN = re.compile(r"room (?P<room>.+)$", re.IGNORECASE)
+PLAIN_CHAT_PATTERN = re.compile(r"^\[\d{2}:\d{2}:\d{2}\] (?P<username>.+?): (?P<message>.+)$")
 
 
 def parse_args(argv):
@@ -67,6 +88,19 @@ def enable_ansi_colors():
             kernel32.SetConsoleMode(handle, mode.value | 0x0004)
     except Exception:
         pass
+
+
+def enable_utf8_output():
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 
 def receive_line(sock, buffer):
@@ -112,6 +146,68 @@ def parse_scrypt_cost(cost):
         key, raw_value = item.split("=", 1)
         values[key] = int(raw_value)
     return values["n"], values["r"], values["p"]
+
+
+def get_username_color(username):
+    digest = hashlib.sha256(username.encode("utf-8")).digest()
+    return ANSI_COLORS[digest[0] % len(ANSI_COLORS)]
+
+
+def room_type_emoji(is_protected):
+    if is_protected:
+        return PROTECTED_ROOM_EMOJI
+
+    return OPEN_ROOM_EMOJI
+
+
+def format_local_room_message(username, room_name, is_protected, message):
+    timestamp = time.strftime("%H:%M:%S")
+    colored_username = f"{get_username_color(username)}{username}{ANSI_RESET}"
+    return (
+        f"[{timestamp}] "
+        f"{{{room_name}}} "
+        f"{{{room_type_emoji(is_protected)}}} "
+        f"{colored_username}: {message}"
+    )
+
+
+def parse_room_state_from_server_message(message):
+    if not message.startswith("[server] "):
+        return None
+
+    if "room " not in message.lower():
+        return None
+
+    match = ROOM_RESPONSE_PATTERN.search(message)
+    if match is None:
+        return None
+
+    room_fragment = match.group("room").strip().rstrip(".")
+    is_protected = PROTECTED_ROOM_MARKER in room_fragment
+    room_name = room_fragment.replace(PROTECTED_ROOM_MARKER, "").strip()
+    if not room_name:
+        return None
+
+    return {
+        "name": room_name,
+        "protected": is_protected,
+    }
+
+
+def enrich_received_room_message(message, room_state):
+    if "{" in message:
+        return message
+
+    match = PLAIN_CHAT_PATTERN.match(message)
+    if match is None:
+        return message
+
+    return (
+        f"{message[:11]} "
+        f"{{{room_state['name']}}} "
+        f"{{{room_type_emoji(room_state['protected'])}}} "
+        f"{message[11:]}"
+    )
 
 
 def read_console_line(prompt):
@@ -326,6 +422,8 @@ def receive_messages(
     known_keys_lock,
     pair_session_keys,
     pair_keys_lock,
+    room_state,
+    room_state_lock,
     initial_buffer=b"",
 ):
     buffer = initial_buffer
@@ -362,6 +460,15 @@ def receive_messages(
                         continue
             except (ValueError, binascii.Error, UnicodeDecodeError):
                 message = "[client] Annuaire de cles publiques invalide."
+
+            parsed_room_state = parse_room_state_from_server_message(message)
+            if parsed_room_state is not None:
+                with room_state_lock:
+                    room_state["name"] = parsed_room_state["name"]
+                    room_state["protected"] = parsed_room_state["protected"]
+
+            with room_state_lock:
+                message = enrich_received_room_message(message, room_state)
 
             try:
                 with pair_keys_lock:
@@ -687,6 +794,11 @@ def run_client(host, port):
     known_keys_lock = threading.Lock()
     pair_session_keys = {}
     pair_keys_lock = threading.Lock()
+    room_state = {
+        "name": "general",
+        "protected": False,
+    }
+    room_state_lock = threading.Lock()
 
     receiver = threading.Thread(
         target=receive_messages,
@@ -701,6 +813,8 @@ def run_client(host, port):
             known_keys_lock,
             pair_session_keys,
             pair_keys_lock,
+            room_state,
+            room_state_lock,
             buffer,
         ),
         daemon=True,
@@ -815,6 +929,19 @@ def run_client(host, port):
                 continue
 
             try:
+                with room_state_lock:
+                    local_room_name = room_state["name"]
+                    local_room_protected = room_state["protected"]
+
+                print(
+                    format_local_room_message(
+                        username,
+                        local_room_name,
+                        local_room_protected,
+                        message,
+                    ),
+                    flush=True,
+                )
                 send_secure_line(sock, transport_key, message)
             except OSError:
                 print("Impossible d'envoyer le message: connexion fermee.")
@@ -832,6 +959,7 @@ def run_client(host, port):
 
 def main():
     enable_ansi_colors()
+    enable_utf8_output()
 
     try:
         host, port = parse_args(sys.argv)
