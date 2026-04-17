@@ -1,1 +1,3 @@
-
+alice:scrypt:n=16384,r=8,p=1:zg48E3hlV/xRzHpIPa9rsw==:VqXeLSken7eZ6554JexCHO7UfYJjgK7i8u7rA60aJ9L/oPeIi5yD9h1cupjzaxF0Tta6IvclZ9uedFFEzNEvGg==
+bob:scrypt:n=16384,r=8,p=1:RjwktQV+wKZWZITL7HQpNw==:uTcnGia9gqo4Yk7yocp0+pnWSF9WxEqRB3f5btzzwnIdiuDby801GRNBIFyIc5w1+WJ1fyL/j1gcMiOUGH4YYA==
+jean:scrypt:n=16384,r=8,p=1:TVfsSXJ3r3EAsL0iAVouhA==:EUmQNcfG6nW3MjIUwSHrn4eYcnSnvnxqoSNnC4LCn08VEyBRIZL4gUwoEZoYCm4uGac5TJYsQHfgCTrHI29VQg==
