@@ -1,6 +1,6 @@
 # Crypto Vibes
 
-Projet de chat multi-utilisateurs en Python realise par etapes, avec progression depuis un chat TCP simple jusqu'a un chat avec authentification, chiffrement de transport et messages prives E2EE signes.
+Projet de chat multi-utilisateurs en Python realise par etapes, avec progression depuis un chat TCP simple jusqu'a un chat avec authentification, chiffrement de transport et messages prives E2EE signes. Ce projet a été réalisé avec l'aide de l'intelligence artificielle.
 
 ## Fonctionnalites
 
